@@ -1,0 +1,13 @@
+# Pinned to a recent vLLM that works on T4 (Ampere, sm_80).
+# If you have a different GPU, see vLLM's compatibility matrix.
+vllm>=0.6.0,<0.8.0
+
+# Core
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+seaborn>=0.13
+
+# Test
+# (stdlib unittest is enough; we don't need pytest)
+

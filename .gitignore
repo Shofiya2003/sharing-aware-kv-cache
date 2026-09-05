@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# vLLM
+.vllm_cache/
+*.vllm/
+
+# Project
+results/csv/*.csv
+results/figures/*.png
+results/INTERPRETATION.md
+results/logs/
+*.log
+
