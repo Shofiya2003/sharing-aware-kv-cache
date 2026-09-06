@@ -131,6 +131,7 @@ class VLLMBackend:
         self._tasks: Dict[str, asyncio.Task] = {}
 
     async def start(self) -> None:
+        import inspect
         try:
             from vllm import AsyncLLMEngine, AsyncEngineArgs
         except Exception as e:  # noqa: BLE001
@@ -138,7 +139,11 @@ class VLLMBackend:
                 f"vllm is not importable: {e!r}. Run this on a GPU host."
             ) from e
 
-        args = AsyncEngineArgs(
+        # Only pass arguments that this vLLM version's AsyncEngineArgs
+        # actually supports. Newer vLLM removed `disable_log_stats` (refactored
+        # into the logging plugin system); older versions need it to be set
+        # explicitly. This keeps the code portable across vLLM 0.6.x..0.10.x.
+        kwargs = dict(
             model=self.cfg.model,
             gpu_memory_utilization=self.cfg.gpu_memory_utilization,
             max_model_len=self.cfg.max_model_len,
@@ -147,8 +152,12 @@ class VLLMBackend:
             enforce_eager=self.cfg.enforce_eager,
             max_num_seqs=self.cfg.max_num_seqs,
             seed=self.cfg.seed,
-            disable_log_stats=False,
         )
+        sig = inspect.signature(AsyncEngineArgs)
+        if "disable_log_stats" in sig.parameters:
+            kwargs["disable_log_stats"] = False
+
+        args = AsyncEngineArgs(**kwargs)
         self.engine = AsyncLLMEngine.from_engine_args(args)
         self._started = True
         logger.info(
