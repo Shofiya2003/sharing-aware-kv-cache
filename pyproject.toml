@@ -7,10 +7,13 @@ readme = "README.md"
 license = { text = "MIT" }
 dependencies = [
     "vllm>=0.6.0,<0.8.0",
-    "pandas>=2.0",
-    "numpy>=1.24",
-    "matplotlib>=3.7",
-    "seaborn>=0.13",
+    "pandas>=2.0,<2.3",
+    "matplotlib>=3.7,<3.10",
+    "seaborn>=0.13,<0.14",
+    # Note: numpy is intentionally NOT a direct dep — vLLM owns the numpy
+    # install on the GPU host. Listing numpy here causes pip to upgrade it
+    # under vLLM, leading to:
+    #   ValueError: numpy.dtype size changed, may indicate binary incompatibility
 ]
 
 [project.optional-dependencies]

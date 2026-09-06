@@ -1,12 +1,18 @@
 # Pinned to a recent vLLM that works on T4 (Ampere, sm_80).
 # If you have a different GPU, see vLLM's compatibility matrix.
+#
+# IMPORTANT: on Kaggle, vLLM is *preinstalled* in /usr/local/lib/python3.12/dist-packages/
+# and is compiled against the specific numpy ABI shipped with that image. If `pip install`
+# upgrades numpy underneath vLLM, you get:
+#   ValueError: numpy.dtype size changed, may indicate binary incompatibility
+# so we DO NOT install/upgrade numpy here. vLLM manages its own numpy.
 vllm>=0.6.0,<0.8.0
 
-# Core
-pandas>=2.0
-numpy>=1.24
-matplotlib>=3.7
-seaborn>=0.13
+# Core — pinned to versions known to coexist with vLLM's numpy ABI
+# (numpy is intentionally NOT listed; vLLM owns the numpy install on the GPU host).
+pandas>=2.0,<2.3
+matplotlib>=3.7,<3.10
+seaborn>=0.13,<0.14
 
 # Test
 # (stdlib unittest is enough; we don't need pytest)
