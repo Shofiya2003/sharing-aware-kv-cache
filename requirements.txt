@@ -1,12 +1,12 @@
-# Pinned to a recent vLLM that works on T4 (Ampere, sm_80).
-# If you have a different GPU, see vLLM's compatibility matrix.
+# IMPORTANT: on Kaggle (Sep 2025+ image), the system ships torch 2.10 + cu128
+# and numpy 2.0.2 — but NO vLLM. We need to install vLLM whose pinned torch is
+# close to the image's torch. vLLM 0.10.2 pins torch==2.8.0, which is close
+# enough to 2.10 that pip will let it downgrade without breaking the CUDA
+# toolkit. vLLM >= 0.27 pins torch==2.13.0 which is too far ahead.
 #
-# IMPORTANT: on Kaggle, vLLM is *preinstalled* in /usr/local/lib/python3.12/dist-packages/
-# and is compiled against the specific numpy ABI shipped with that image. If `pip install`
-# upgrades numpy underneath vLLM, you get:
-#   ValueError: numpy.dtype size changed, may indicate binary incompatibility
-# so we DO NOT install/upgrade numpy here. vLLM manages its own numpy.
-vllm>=0.6.0,<0.8.0
+# vLLM <= 0.7.x requires numpy<2.0.0 (won't work on this image — numpy 2.0.2 is
+# already there and pulling in 1.x would be a downgrade that breaks other things).
+vllm==0.10.2
 
 # Core — pinned to versions known to coexist with vLLM's numpy ABI
 # (numpy is intentionally NOT listed; vLLM owns the numpy install on the GPU host).
