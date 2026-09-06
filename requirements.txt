@@ -1,12 +1,19 @@
-# IMPORTANT: on Kaggle (Sep 2025+ image), the system ships torch 2.10 + cu128
+# IMPORTANT: on Kaggle (Sep 2025+ image), the system ships torch 2.10+cu128
 # and numpy 2.0.2 — but NO vLLM. We need to install vLLM whose pinned torch is
 # close to the image's torch. vLLM 0.10.2 pins torch==2.8.0, which is close
 # enough to 2.10 that pip will let it downgrade without breaking the CUDA
 # toolkit. vLLM >= 0.27 pins torch==2.13.0 which is too far ahead.
 #
-# vLLM <= 0.7.x requires numpy<2.0.0 (won't work on this image — numpy 2.0.2 is
-# already there and pulling in 1.x would be a downgrade that breaks other things).
+# vLLM 0.10.2 declares `transformers>=4.55.2`, but pip will happily install
+# transformers 5.x, which BREAKS vLLM because Qwen2Tokenizer's
+# `all_special_tokens_extended` was removed in transformers 5.0. So we pin
+# transformers to the latest 4.5x (4.57.6) which still has the property.
+#
+# vLLM <= 0.7.x requires numpy<2.0.0 (won't work on this image — numpy 2.0.2
+# is already there and pulling in 1.x would be a downgrade that breaks other
+# things).
 vllm==0.10.2
+transformers==4.57.6
 
 # Core — pinned to versions known to coexist with vLLM's numpy ABI
 # (numpy is intentionally NOT listed; vLLM owns the numpy install on the GPU host).
