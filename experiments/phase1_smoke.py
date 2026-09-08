@@ -142,14 +142,24 @@ async def main() -> int:
               f"max={max(lats):.0f}ms "
               f"mean={statistics.mean(lats):.0f}ms")
 
-        # Recommendation
+        # Recommendation. hit_thr must sit BETWEEN fast (cache-hit-like)
+        # and slow (contended full-prefill) latencies: use the geometric
+        # mean, which stays sane even when the two differ by 100x (an
+        # arithmetic mean would be dominated by the slow end). SLA must sit
+        # above hit_thr, else every hit is also an SLA violation.
         print()
         print("[phase1] [4/4] recommended Phase 5 settings:", flush=True)
-        print(f"  sla_latency_ms       = {int(max(baseline_ms * 8, 2000))}")
+        import math
         if min(lats) < baseline_ms * 2:
             hit_thr = int(min(lats) * 1.3)
         else:
-            hit_thr = int((baseline_ms + min(lats)) / 2)
+            hit_thr = int(math.sqrt(baseline_ms * min(lats)))
+        sla = int(max(baseline_ms * 8, 2000))
+        if sla <= hit_thr:
+            sla = int(hit_thr * 4)
+            print(f"[phase1] note: baseline*8 SLA fell below hit_thr; "
+                  f"raised SLA to 4x hit_thr.", flush=True)
+        print(f"  sla_latency_ms       = {sla}")
         print(f"  hit_latency_threshold= {hit_thr}")
         print(f"  generous gpu_memory  = 0.7 (or higher if VRAM allows)")
         print(f"  constrained gpu_mem  = {args.gpu_memory}")
