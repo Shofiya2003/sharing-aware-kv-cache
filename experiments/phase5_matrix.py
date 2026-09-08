@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import os
 import sys
 import time
@@ -35,11 +36,16 @@ async def run_one(
     output_dir: str,
 ) -> dict:
     label = f"{policy}_{capacity}"
-    print(f"[phase5] >>> starting run: {label}")
+    # NOTE: cfg_template.backend must be deep-copied per run. All pairs
+    # previously shared one BackendConfig object, so the last-assigned
+    # gpu_memory_utilization (constrained) silently applied to every run,
+    # invalidating the generous-vs-constrained comparison.
+    print(f"[phase5] >>> starting run: {label} "
+          f"(gpu_mem={cfg_template.backend.gpu_memory_utilization}, mock={mock})")
     cfg = BenchConfig(
         policy_name=policy,
         combined_alpha=cfg_template.combined_alpha,
-        backend=cfg_template.backend,
+        backend=copy.deepcopy(cfg_template.backend),
         capacity_setting=capacity,
         max_new_tokens=cfg_template.max_new_tokens,
         speed_factor=cfg_template.speed_factor,
@@ -150,11 +156,34 @@ async def main() -> int:
             ("constrained", args.constrained_gpu_mem),
         ]:
             if args.only:
-                if not any(o in (policy, cap_name) for o in args.only):
+                # AND semantics: every token must match this pair, where a
+                # token matches if it equals the policy, the capacity, or
+                # the "policy_capacity" label. E.g. `--only fifo
+                # constrained` runs just fifo_constrained; `--only
+                # combined` runs both combined_*; `--only constrained`
+                # runs all *_constrained.
+                label = f"{policy}_{cap_name}"
+                if not all(
+                    o in (policy, cap_name, label) for o in args.only
+                ):
                     continue
-            cfg = base_cfg
-            cfg.backend.gpu_memory_utilization = gpu_mem
+            # Fresh backend per pair: never mutate a shared object.
+            backend = BackendConfig(
+                model=base_backend.model,
+                gpu_memory_utilization=gpu_mem,
+                max_model_len=base_backend.max_model_len,
+                max_num_seqs=base_backend.max_num_seqs,
+            )
+            cfg = BenchConfig(
+                policy_name="fifo",
+                backend=backend,
+                max_new_tokens=base_cfg.max_new_tokens,
+                speed_factor=base_cfg.speed_factor,
+                sla_latency_ms=base_cfg.sla_latency_ms,
+                hit_latency_threshold_ms=base_cfg.hit_latency_threshold_ms,
+            )
             pairs.append((policy, cap_name, cfg))
+            print(f"[phase5] queued run: {policy}_{cap_name} (gpu_mem={gpu_mem})")
 
     results = []
     for policy, cap, cfg in pairs:

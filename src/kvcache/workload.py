@@ -91,18 +91,6 @@ class Workload:
     config: Optional[WorkloadConfig] = None
     sharing_sids: set = field(default_factory=set)
 
-import random
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-
-from .session import (
-    Session,
-    Turn,
-    sample_active_burst,
-    sample_active_inter_turn_dt,
-    sample_idle_gap,
-)
-
 
 def _sample_shared_doc(
     rng: random.Random, cfg: WorkloadConfig

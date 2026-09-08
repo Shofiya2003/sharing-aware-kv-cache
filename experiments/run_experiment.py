@@ -37,7 +37,11 @@ async def run_single(
     args,
 ) -> dict:
     label = f"{policy}_{capacity}"
-    print(f"[run] >>> {label} (gpu_mem={gpu_mem}, mock={args.mock})")
+    print(f"[run] >>> {label}: policy={policy} capacity={capacity} gpu_mem={gpu_mem} "
+          f"mock={args.mock} sessions={len(workload.sessions)} events={len(workload.events)} "
+          f"sla={args.sla_latency_ms:.0f}ms hit_thr={args.hit_latency_threshold_ms:.0f}ms "
+          f"max_seqs={args.max_num_seqs} max_new_tokens={args.max_new_tokens} "
+          f"speed x{args.speed_factor}", flush=True)
     cfg = BenchConfig(
         policy_name=policy,
         combined_alpha=args.combined_alpha,

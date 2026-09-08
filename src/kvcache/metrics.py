@@ -18,6 +18,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 @dataclass
 class RequestRecord:
@@ -60,7 +61,6 @@ def percentile(xs: Sequence[float], pct: float) -> float:
         return s[int(k)]
     return s[f] + (s[c] - s[f]) * (k - f)
 
-from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -147,19 +147,6 @@ class MetricsLogger:
         # Touch the window in the dict so that finalize emits a row
         # even if it had no data.
         self._win_states.setdefault(w, self._new_win_state())
-
-    def _new_win_state(self) -> Dict:
-        return {
-            "lookups": 0,
-            "hits": 0,
-            "misses": 0,
-            "shared_hits": 0,
-            "unique_hits": 0,
-            "latencies": [],
-            "good": 0,
-            "in_flight_sum": 0,
-            "in_flight_max": 0,
-        }
 
     def _format_window_row(self, w: int, st: Dict) -> List:
         total = st["hits"] + st["misses"]

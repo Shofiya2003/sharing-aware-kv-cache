@@ -175,6 +175,14 @@ async def run_benchmark(
     speed = max(1e-3, cfg.speed_factor)
     sim_start_wall = time.monotonic()
     last_window_flushed = -1
+    n_dispatched = 0
+    n_completed = 0
+    n_events = 0
+    print(f"[bench:{cfg.run_label}] start: policy={cfg.policy_name} "
+          f"capacity={cfg.capacity_setting} events={len(workload.events)} "
+          f"sessions={len(workload.sessions)} sim_window={sim_window:.0f}s "
+          f"speed x{speed} max_new_tokens={cfg.max_new_tokens} "
+          f"sla={cfg.sla_latency_ms:.0f}ms hit_thr={cfg.hit_latency_threshold_ms:.0f}ms")
 
     try:
         ei = 0
@@ -219,11 +227,52 @@ async def run_benchmark(
                     max_new_tokens=cfg.max_new_tokens,
                 )
                 in_flight[rid] = head
+                n_dispatched += 1
                 if len(in_flight) >= max_in_flight:
                     break
 
-            # 5. Wait for at least one in-flight request to complete
+            # 5. Collect completions. Two sub-steps:
+            #   (a) reap futures that are ALREADY done (no waiting). This
+            #       must come first: a future that finished between dispatch
+            #       and this scan would otherwise be skipped by the pending
+            #       filter below and sit stale in `in_flight` forever,
+            #       wedging the driver in a sleep(0) spin.
+            #   (b) if anything is still in flight, wait for the next
+            #       completion. Drain ALL done futures (no `break`): with
+            #       concurrent backends several requests routinely finish in
+            #       the same wait window.
             if in_flight:
+                for rid in list(in_flight.keys()):
+                    fut = getattr(backend, "_pending", {}).get(rid)
+                    if fut is None or not fut.done():
+                        continue
+                    qr = in_flight.pop(rid, None)
+                    if qr is None:
+                        continue
+                    try:
+                        res = await backend.wait(rid)
+                    except Exception as e:  # noqa: BLE001
+                        res = RequestResult(
+                            request_id=rid,
+                            text="",
+                            submit_t=qr.event.t,
+                            submit_wall_t=time.monotonic(),
+                            first_token_t=0.0,
+                            complete_t=time.monotonic(),
+                            n_output_tokens=0,
+                            n_prompt_tokens=0,
+                            error=repr(e),
+                        )
+                    _record_request(
+                        qr, res, cfg, metrics, overlap, len(in_flight) + 1, sim_now
+                    )
+                    n_completed += 1
+                    if n_completed == 1 or n_completed % 50 == 0:
+                        print(f"[bench:{cfg.run_label}] progress: "
+                              f"completed={n_completed} dispatched={n_dispatched} "
+                              f"enqueued={ei}/{n_events} in_flight={len(in_flight)} "
+                              f"queue={len(queue)} sim_t={sim_now:.1f}s")
+
                 wait_tasks = []
                 for rid in list(in_flight.keys()):
                     fut = getattr(backend, "_pending", {}).get(rid)
@@ -258,9 +307,19 @@ async def run_benchmark(
                                 _record_request(
                                     qr, res, cfg, metrics, overlap, len(in_flight) + 1, sim_now
                                 )
+                                n_completed += 1
+                                if n_completed == 1 or n_completed % 50 == 0:
+                                    print(f"[bench:{cfg.run_label}] progress: "
+                                          f"completed={n_completed} dispatched={n_dispatched} "
+                                          f"enqueued={ei}/{n_events} in_flight={len(in_flight)} "
+                                          f"queue={len(queue)} sim_t={sim_now:.1f}s")
                                 break
+                    if not done:
+                        await asyncio.sleep(0.0)
                 else:
-                    await asyncio.sleep(0.0)
+                    # In-flight rids with no pending future in the backend
+                    # (should not happen) — yield to avoid a hot spin.
+                    await asyncio.sleep(0.01)
             else:
                 await asyncio.sleep(0.0)
 
@@ -268,12 +327,19 @@ async def run_benchmark(
             # We flush window W only when sim_now has crossed (W+1) * window_s,
             # which means W is fully past. Window 0 is always flushed by
             # `finalize` so we don't have to worry about partial-row races.
+            # NOTE: flush_window() is a metadata touch only (no I/O); the
+            # time-series CSV is written atomically at finalize, so late
+            # stragglers for the same window are still counted.
             current_window = int(sim_now // metrics.cfg.window_s)
-            if last_window_flushed >= 0:
-                while (last_window_flushed + 1) * metrics.cfg.window_s < sim_now:
-                    last_window_flushed += 1
-                    metrics.flush_window(last_window_flushed)
+            while last_window_flushed < current_window - 1:
+                last_window_flushed += 1
+                metrics.flush_window(last_window_flushed)
+                if last_window_flushed % 5 == 0:
+                    print(f"[bench:{cfg.run_label}] window {last_window_flushed} closed "
+                          f"(sim_t={sim_now:.1f}s completed={n_completed})")
     finally:
+        print(f"[bench:{cfg.run_label}] finalizing: dispatched={n_dispatched} "
+              f"completed={n_completed} events={n_events}")
         summary = metrics.finalize(sim_window_s=sim_window)
         if should_stop:
             await backend.stop()

@@ -59,16 +59,23 @@ async def main() -> int:
         enforce_eager=args.enforce_eager,
     )
     backend = VLLMBackend(cfg)
-    print(f"[phase1] starting vLLM with model={args.model} gpu_mem={args.gpu_memory} ...")
+    print(f"[phase1] [1/4] starting vLLM: model={args.model} gpu_mem={args.gpu_memory} "
+          f"max_len={args.max_model_len} max_seqs={args.max_num_seqs} "
+          f"enforce_eager={args.enforce_eager} burst={args.burst} "
+          f"max_new_tokens={args.max_new_tokens} ...", flush=True)
     try:
         await backend.start()
     except VLLMUnavailable as e:
         print(f"[phase1] vLLM unavailable: {e}")
         print("[phase1] (this is expected on CPU-only dev hosts)")
+        print("[phase1] Kaggle hints: enable GPU (Settings -> Accelerator -> GPU T4), "
+              "enable Internet (needed for model download), re-run launcher cell 2 first.")
         return 1
+    print("[phase1] [1/4] engine start OK", flush=True)
 
     try:
         # Baseline single request
+        print("[phase1] [2/4] baseline: sending 1 short probe request ...", flush=True)
         t0 = time.monotonic()
         res = await backend.submit_and_wait(
             prompt=LONG_PROMPT[:200],
@@ -78,11 +85,12 @@ async def main() -> int:
             max_new_tokens=args.max_new_tokens,
         )
         baseline_ms = (time.monotonic() - t0) * 1000.0
-        print(f"[phase1] baseline single-request latency: {baseline_ms:.0f} ms")
-        print(f"[phase1]   (prompt tokens: {res.n_prompt_tokens})")
+        print(f"[phase1] [2/4] baseline single-request latency: {baseline_ms:.0f} ms "
+              f"(prompt tokens: {res.n_prompt_tokens}, output: {res.n_output_tokens})", flush=True)
 
         # Burst
-        print(f"[phase1] firing burst of {args.burst} concurrent long-prompt requests ...")
+        print(f"[phase1] [3/4] burst: firing {args.burst} concurrent long-prompt "
+              f"requests (max_seqs={args.max_num_seqs}) ...", flush=True)
         submit_t = time.monotonic()
         rids = []
         for i in range(args.burst):
@@ -95,11 +103,16 @@ async def main() -> int:
             )
             rids.append(rid)
         lats = []
-        for rid in rids:
+        for j, rid in enumerate(rids):
             r = await backend.wait(rid)
             lats.append(r.latency_ms)
+            print(f"[phase1]   burst req {j+1}/{len(rids)} done: {r.latency_ms:.0f}ms "
+                  f"(prompt={r.n_prompt_tokens}tok)", flush=True)
         total_ms = (time.monotonic() - submit_t) * 1000.0
-        print(f"[phase1] burst complete in {total_ms:.0f} ms wall")
+        print(f"[phase1] [3/4] burst complete in {total_ms:.0f} ms wall", flush=True)
+        if not lats:
+            print("[phase1] ERROR: burst returned no latencies; engine produced no results.")
+            return 1
         print(f"[phase1]   per-request latency: min={min(lats):.0f}ms "
               f"median={statistics.median(lats):.0f}ms "
               f"max={max(lats):.0f}ms "
@@ -107,7 +120,7 @@ async def main() -> int:
 
         # Recommendation
         print()
-        print("[phase1] recommended Phase 5 settings:")
+        print("[phase1] [4/4] recommended Phase 5 settings:", flush=True)
         print(f"  sla_latency_ms       = {int(max(baseline_ms * 8, 2000))}")
         if min(lats) < baseline_ms * 2:
             hit_thr = int(min(lats) * 1.3)

@@ -131,6 +131,11 @@ class VLLMBackend:
         self._tasks: Dict[str, asyncio.Task] = {}
 
     async def start(self) -> None:
+        print(f"[vllm] starting engine: model={self.cfg.model} "
+              f"gpu_mem={self.cfg.gpu_memory_utilization} "
+              f"max_len={self.cfg.max_model_len} max_seqs={self.cfg.max_num_seqs} "
+              f"prefix_caching={self.cfg.enable_prefix_caching} "
+              f"enforce_eager={self.cfg.enforce_eager}")
         import inspect
         try:
             from vllm import AsyncLLMEngine, AsyncEngineArgs
@@ -158,8 +163,19 @@ class VLLMBackend:
             kwargs["disable_log_stats"] = False
 
         args = AsyncEngineArgs(**kwargs)
-        self.engine = AsyncLLMEngine.from_engine_args(args)
+        try:
+            self.engine = AsyncLLMEngine.from_engine_args(args)
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            hint = ""
+            if "memory" in msg.lower() or "cuda" in msg.lower() or "oom" in msg.lower():
+                hint = (" HINT: vLLM could not allocate with "
+                        f"gpu_memory_utilization={self.cfg.gpu_memory_utilization}. "
+                        "On a 16GB T4 try --gpu-memory 0.4-0.5 for Phase 1, "
+                        "lower --max-model-len (e.g. 2048), or pass enforce_eager=True.")
+            raise VLLMUnavailable(f"vLLM engine failed to start: {e!r}.{hint}") from e
         self._started = True
+        print(f"[vllm] engine started OK: model={self.cfg.model}")
         logger.info(
             "vLLM engine started: model=%s gpu_mem=%.2f max_len=%d prefix_caching=%s",
             self.cfg.model,
