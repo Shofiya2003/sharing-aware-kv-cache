@@ -49,6 +49,12 @@ async def main() -> int:
     p.add_argument("--burst", type=int, default=10)
     p.add_argument("--max-new-tokens", type=int, default=8)
     p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--warmup", type=int, default=2,
+                   help="Untimed warmup requests before the timed baseline. "
+                        "The first requests pay one-time costs (Triton kernel "
+                        "compilation, CUDA-graph capture); without warmup the "
+                        "baseline is inflated 10-50x and the recommended "
+                        "SLA/hit-threshold are garbage.")
     args = p.parse_args()
 
     cfg = BackendConfig(
@@ -74,6 +80,24 @@ async def main() -> int:
     print("[phase1] [1/4] engine start OK", flush=True)
 
     try:
+        # Warmup (untimed): first requests compile kernels / capture graphs.
+        if args.warmup > 0:
+            print(f"[phase1] [1b/4] warmup: {args.warmup} untimed requests ...", flush=True)
+            for i in range(args.warmup):
+                t0 = time.monotonic()
+                await backend.submit_and_wait(
+                    prompt=LONG_PROMPT[:200],
+                    session_id=f"warm{i}",
+                    turn_index=0,
+                    submit_t=0.0,
+                    max_new_tokens=4,
+                )
+                print(f"[phase1]   warmup {i+1}/{args.warmup}: "
+                      f"{(time.monotonic() - t0) * 1000.0:.0f} ms "
+                      f"(first one is normally huge — that's compilation, ignore it)",
+                      flush=True)
+            print("[phase1] [1b/4] warmup done — steady-state timings follow", flush=True)
+
         # Baseline single request
         print("[phase1] [2/4] baseline: sending 1 short probe request ...", flush=True)
         t0 = time.monotonic()
