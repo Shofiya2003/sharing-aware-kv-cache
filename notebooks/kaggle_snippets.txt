@@ -3,8 +3,17 @@
 # 1. Pull the latest code (same as launcher cell 1, as a one-liner)
 !cd /kaggle/working/sharing-aware-kv-cache && git pull --ff-only
 
-# 2. Zip all matrix results for one-click download
+# 2. Zip all matrix results for one-click download (option A: one-liner)
 !cd /kaggle/working/sharing-aware-kv-cache && python experiments/zip_results.py --out /kaggle/working/kvcache_results.zip
+
+# 2b. Same thing as a Python cell (option B: subprocess snippet)
+import subprocess
+subprocess.run(
+    ["zip", "-r", "/kaggle/working/kvcache_results.zip",
+     "results/csv", "results/figures", "results/INTERPRETATION.md"],
+    cwd="/kaggle/working/sharing-aware-kv-cache", check=True,
+)
+print("zipped OK")
 
 # 3. Re-run Phase 1 calibration (after pulling latest main)
 !cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/phase1_smoke.py --gpu-memory 0.3 --burst 10
