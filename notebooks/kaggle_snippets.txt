@@ -1,5 +1,9 @@
 # Kaggle one-liners (paste each into its own notebook cell and run)
 
+# 0. Fresh session: pull latest + restore archived base CSVs (no-clobber:
+# existing/partial runs are kept). After this, cell 3b shows all 8 as done.
+!cd /kaggle/working/sharing-aware-kv-cache && git pull --ff-only && mkdir -p results/csv && cp -n result_from_first_experiment/csv/*.csv results/csv/ && ls results/csv/summary_*.csv | wc -l
+
 # 1. Pull the latest code (same as launcher cell 1, as a one-liner)
 !cd /kaggle/working/sharing-aware-kv-cache && git pull --ff-only
 
