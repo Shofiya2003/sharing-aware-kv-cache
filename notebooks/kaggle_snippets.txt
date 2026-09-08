@@ -19,6 +19,10 @@ subprocess.run(
 )
 print("zipped OK")
 
+# 8. Download experiment-2 results (same zip script — it bundles whole
+# directories, so suffixed _s1/_a025 CSVs and refreshed charts are included)
+!cd /kaggle/working/sharing-aware-kv-cache && python experiments/zip_results.py --out /kaggle/working/kvcache_results_exp2.zip
+
 # 3. Re-run Phase 1 calibration (after pulling latest main)
 !cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/phase1_smoke.py --gpu-memory 0.3 --burst 10
 
