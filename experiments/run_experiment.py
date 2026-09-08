@@ -64,6 +64,21 @@ async def run_single(
     else:
         backend = VLLMBackend(cfg.backend)
     await backend.start()
+    # Warmup (untimed, excluded from metrics): a fresh engine pays one-time
+    # kernel-compilation cost on its first requests. Without this, the first
+    # workload events absorb ~30s of compilation and pollute P99 + early
+    # windows. Both backends expose submit()/wait().
+    print(f"[run] {label}: warmup (2 untimed requests) ...", flush=True)
+    for i in range(2):
+        rid = await backend.submit(
+            prompt="warmup probe request",
+            session_id=f"__warm{i}__",
+            turn_index=0,
+            submit_t=0.0,
+            max_new_tokens=4,
+        )
+        await backend.wait(rid)
+    print(f"[run] {label}: warmup done", flush=True)
     t0 = time.monotonic()
     try:
         r = await run_benchmark(workload, cfg, backend=backend)

@@ -61,6 +61,19 @@ async def run_one(
         backend = VLLMBackend(cfg.backend)
         await backend.start()
 
+    # Warmup (untimed, excluded from metrics): see run_experiment.py.
+    print(f"[phase5] {label}: warmup (2 untimed requests) ...", flush=True)
+    for i in range(2):
+        rid = await backend.submit(
+            prompt="warmup probe request",
+            session_id=f"__warm{i}__",
+            turn_index=0,
+            submit_t=0.0,
+            max_new_tokens=4,
+        )
+        await backend.wait(rid)
+    print(f"[phase5] {label}: warmup done", flush=True)
+
     t0 = time.monotonic()
     try:
         r = await run_benchmark(workload, cfg, backend=backend)
