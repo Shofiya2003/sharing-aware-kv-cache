@@ -215,6 +215,30 @@ class TestMetrics(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(tmp, "summary_x.csv")))
 
 
+class TestAnalysisLabels(unittest.TestCase):
+    def test_split_base_labels(self):
+        from kvcache.analysis import _split_policy_and_capacity  # noqa: E402
+        self.assertEqual(
+            _split_policy_and_capacity("combined_constrained"),
+            ("combined", "constrained", ""),
+        )
+        self.assertEqual(
+            _split_policy_and_capacity("session-aware_generous"),
+            ("session-aware", "generous", ""),
+        )
+
+    def test_split_variant_labels(self):
+        from kvcache.analysis import _split_policy_and_capacity  # noqa: E402
+        self.assertEqual(
+            _split_policy_and_capacity("combined_constrained_a025"),
+            ("combined", "constrained", "_a025"),
+        )
+        self.assertEqual(
+            _split_policy_and_capacity("fifo_generous_s1"),
+            ("fifo", "generous", "_s1"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 

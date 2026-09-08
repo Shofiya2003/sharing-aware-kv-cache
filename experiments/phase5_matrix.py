@@ -34,8 +34,13 @@ async def run_one(
     cfg_template: BenchConfig,
     mock: bool,
     output_dir: str,
+    label_suffix: str = "",
 ) -> dict:
     label = f"{policy}_{capacity}"
+    if label_suffix:
+        if not label_suffix.startswith("_"):
+            label_suffix = "_" + label_suffix
+        label += label_suffix
     # NOTE: cfg_template.backend must be deep-copied per run. All pairs
     # previously shared one BackendConfig object, so the last-assigned
     # gpu_memory_utilization (constrained) silently applied to every run,
@@ -132,6 +137,11 @@ async def main() -> int:
         "--only", nargs="*", default=None,
         help="If set, only run these (policy, capacity) pairs. E.g. 'combined' or 'constrained'.",
     )
+    p.add_argument(
+        "--label-suffix", default="",
+        help="Appended to every run label, e.g. '_s1' for a reseed repeat. "
+             "Lets follow-up matrixes coexist with earlier runs.",
+    )
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -200,7 +210,8 @@ async def main() -> int:
 
     results = []
     for policy, cap, cfg in pairs:
-        s = await run_one(policy, cap, workload, cfg, args.mock, args.output_dir)
+        s = await run_one(policy, cap, workload, cfg, args.mock, args.output_dir,
+                          label_suffix=args.label_suffix)
         results.append({"policy": policy, "capacity": cap, **s})
 
     # Print a small summary

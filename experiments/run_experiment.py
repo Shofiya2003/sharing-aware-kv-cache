@@ -37,6 +37,11 @@ async def run_single(
     args,
 ) -> dict:
     label = f"{policy}_{capacity}"
+    if args.label_suffix:
+        suffix = args.label_suffix
+        if not suffix.startswith("_"):
+            suffix = "_" + suffix
+        label += suffix
     print(f"[run] >>> {label}: policy={policy} capacity={capacity} gpu_mem={gpu_mem} "
           f"mock={args.mock} sessions={len(workload.sessions)} events={len(workload.events)} "
           f"sla={args.sla_latency_ms:.0f}ms hit_thr={args.hit_latency_threshold_ms:.0f}ms "
@@ -158,6 +163,11 @@ def main() -> int:
     p.add_argument("--fig-dir", default="results/figures")
     p.add_argument("--mock", action="store_true", help="Use the mock backend (no GPU).")
     p.add_argument("--analyze-only", action="store_true", help="Skip runs; only regenerate charts from existing CSVs.")
+    p.add_argument("--label-suffix", default="",
+                   help="Appended to the run label (CSV/chart names), e.g. '_s1' "
+                        "for a reseed repeat or '_a025' for combined_alpha=0.25. "
+                        "Lets follow-up runs coexist with the base matrix instead "
+                        "of overwriting it. Analysis plots variants as dashed lines.")
     args = p.parse_args()
     return asyncio.run(amain(args))
 

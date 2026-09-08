@@ -82,18 +82,54 @@ import pandas as pd
 import seaborn as sns
 
 
+import re
+
+# Run labels look like "combined_constrained" or, for follow-up runs,
+# "combined_constrained_a025" / "fifo_generous_s1" (--label-suffix).
+_LABEL_RE = re.compile(
+    r"^(fifo|session-aware|sharing-aware|combined)_(generous|constrained)(_.*)?$"
+)
+
+
 def _split_policy_and_capacity(label: str):
-    """Parse a run label like 'fifo_constrained' or 'combined_generous'."""
+    """Parse a run label into (policy, capacity, variant).
+
+    Variant is "" for base-matrix runs, else the --label-suffix
+    (e.g. "_a025", "_s1"). Unknown labels fall back to (label,
+    "constrained", "") so old files never crash the analysis.
+    """
+    m = _LABEL_RE.match(label)
+    if m:
+        return m.group(1), m.group(2), (m.group(3) or "")
     for cap in ("constrained", "generous"):
         if label.endswith("_" + cap):
-            return label[: -len(cap) - 1], cap
-    return label, "constrained"
+            return label[: -len(cap) - 1], cap, ""
+    return label, "constrained", ""
+
+
+def _matching(rs: RunSet, policy: str, capacity: str):
+    """All (variant, label, df) for a policy x capacity, base ("") first."""
+    out = []
+    for label, df in rs.runs.items():
+        p, c, v = _split_policy_and_capacity(label)
+        if p == policy and c == capacity:
+            out.append((v, label, df))
+    out.sort(key=lambda t: (t[0] != "", t[0]))
+    return out
+
+
+def _legend_name(policy: str, variant: str) -> str:
+    base = POLICY_LABELS.get(policy, policy)
+    if variant:
+        return f"{base} [{variant.lstrip('_')}]"
+    return base
 
 
 def _filter(rs: RunSet, policy: str, capacity: str) -> Optional[pd.DataFrame]:
-    for label, df in rs.runs.items():
-        p, c = _split_policy_and_capacity(label)
-        if p == policy and c == capacity:
+    """Base ("") run for a policy x capacity, or None. Variants are handled
+    by _matching; this keeps single-run call sites deterministic."""
+    for variant, _label, df in _matching(rs, policy, capacity):
+        if variant == "":
             return df
     return None
 
@@ -107,19 +143,18 @@ def plot_headline_hit_rate(rs: RunSet, out_path: str, capacity: str = "constrain
     plt.figure(figsize=(10, 5))
     plotted = 0
     for policy in POLICY_ORDER:
-        df = _filter(rs, policy, capacity)
-        if df is None:
-            continue
-        # Use a rolling mean to smooth out single-window noise
-        smoothed = df["hit_rate"].rolling(window=2, min_periods=1).mean()
-        plt.plot(
-            df["t_start"],
-            smoothed,
-            label=POLICY_LABELS.get(policy, policy),
-            color=POLICY_COLORS.get(policy, None),
-            linewidth=2.0,
-        )
-        plotted += 1
+        for variant, _label, df in _matching(rs, policy, capacity):
+            # Use a rolling mean to smooth out single-window noise
+            smoothed = df["hit_rate"].rolling(window=2, min_periods=1).mean()
+            plt.plot(
+                df["t_start"],
+                smoothed,
+                label=_legend_name(policy, variant),
+                color=POLICY_COLORS.get(policy, None),
+                linewidth=2.0,
+                linestyle="--" if variant else "-",
+            )
+            plotted += 1
     if plotted == 0:
         plt.close()
         return
@@ -137,16 +172,15 @@ def plot_headline_hit_rate(rs: RunSet, out_path: str, capacity: str = "constrain
 def plot_p99_latency(rs: RunSet, out_path: str, capacity: str = "constrained") -> None:
     plt.figure(figsize=(10, 5))
     for policy in POLICY_ORDER:
-        df = _filter(rs, policy, capacity)
-        if df is None:
-            continue
-        plt.plot(
-            df["t_start"],
-            df["p99_latency_ms"],
-            label=POLICY_LABELS.get(policy, policy),
-            color=POLICY_COLORS.get(policy, None),
-            linewidth=2.0,
-        )
+        for variant, _label, df in _matching(rs, policy, capacity):
+            plt.plot(
+                df["t_start"],
+                df["p99_latency_ms"],
+                label=_legend_name(policy, variant),
+                color=POLICY_COLORS.get(policy, None),
+                linewidth=2.0,
+                linestyle="--" if variant else "-",
+            )
     plt.xlabel("Simulated time (s)")
     plt.ylabel("P99 latency (ms)")
     plt.title(f"P99 latency over time — {capacity} capacity")
@@ -161,17 +195,16 @@ def plot_p99_latency(rs: RunSet, out_path: str, capacity: str = "constrained") -
 def plot_goodput(rs: RunSet, out_path: str, capacity: str = "constrained") -> None:
     plt.figure(figsize=(10, 5))
     for policy in POLICY_ORDER:
-        df = _filter(rs, policy, capacity)
-        if df is None:
-            continue
-        smoothed = df["goodput"].rolling(window=2, min_periods=1).mean()
-        plt.plot(
-            df["t_start"],
-            smoothed,
-            label=POLICY_LABELS.get(policy, policy),
-            color=POLICY_COLORS.get(policy, None),
-            linewidth=2.0,
-        )
+        for variant, _label, df in _matching(rs, policy, capacity):
+            smoothed = df["goodput"].rolling(window=2, min_periods=1).mean()
+            plt.plot(
+                df["t_start"],
+                smoothed,
+                label=_legend_name(policy, variant),
+                color=POLICY_COLORS.get(policy, None),
+                linewidth=2.0,
+                linestyle="--" if variant else "-",
+            )
     plt.xlabel("Simulated time (s)")
     plt.ylabel("Goodput (SLA-meeting request fraction)")
     plt.title(f"Goodput over time — {capacity} capacity")
@@ -189,6 +222,9 @@ def plot_fairness(rs: RunSet, out_path: str, capacity: str = "constrained") -> N
     If a policy is starving some sessions (e.g. session-aware ignoring
     sharing signals and starving popular shared content), the distribution
     will be more skewed. We use ECDFs because the per-session N is small.
+
+    Base-matrix runs only; follow-up variants are compared via the
+    time-series charts and the interpretation table.
     """
     plt.figure(figsize=(10, 5))
     for policy in POLICY_ORDER:
@@ -229,17 +265,18 @@ def plot_shared_hit_rate(rs: RunSet, out_path: str, capacity: str = "constrained
     """
     plt.figure(figsize=(10, 5))
     for policy in POLICY_ORDER:
-        df = _filter(rs, policy, capacity)
-        if df is None or "shared_hit_rate" not in df.columns:
-            continue
-        smoothed = df["shared_hit_rate"].rolling(window=2, min_periods=1).mean()
-        plt.plot(
-            df["t_start"],
-            smoothed,
-            label=POLICY_LABELS.get(policy, policy),
-            color=POLICY_COLORS.get(policy, None),
-            linewidth=2.0,
-        )
+        for variant, _label, df in _matching(rs, policy, capacity):
+            if "shared_hit_rate" not in df.columns:
+                continue
+            smoothed = df["shared_hit_rate"].rolling(window=2, min_periods=1).mean()
+            plt.plot(
+                df["t_start"],
+                smoothed,
+                label=_legend_name(policy, variant),
+                color=POLICY_COLORS.get(policy, None),
+                linewidth=2.0,
+                linestyle="--" if variant else "-",
+            )
     plt.xlabel("Simulated time (s)")
     plt.ylabel("Shared-content hit rate (rolling)")
     plt.title(f"Hit rate on shared content over time — {capacity} capacity")
@@ -255,6 +292,8 @@ def plot_ablation_bar(rs: RunSet, out_path: str) -> None:
     """Single bar chart: overall hit rate per policy at constrained capacity.
 
     The simplest "ablation" view: which policy wins?
+    Base-matrix runs only; follow-up variants live in the interpretation
+    table and the dashed time-series lines.
     """
     rows = []
     for policy in POLICY_ORDER:
@@ -304,21 +343,38 @@ def write_interpretation(rs: RunSet, out_path: str) -> None:
     )
     lines.append("| Policy | Capacity | Lookups | Hit rate | Shared hit rate | P50 (ms) | P99 (ms) | Goodput |")
     lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    def row(policy: str, cap: str, s: dict) -> str:
+        return (
+            f"| {_legend_name(policy, s.pop('_variant', ''))} | {cap} | "
+            f"{int(s.get('lookups', 0))} | "
+            f"{s.get('hit_rate', 0):.3f} | "
+            f"{s.get('shared_hit_rate', 0):.3f} | "
+            f"{s.get('p50_latency_ms', 0):.0f} | "
+            f"{s.get('p99_latency_ms', 0):.0f} | "
+            f"{s.get('goodput', 0):.2f} |"
+        )
+
     for policy in POLICY_ORDER:
         for cap in ("constrained", "generous"):
             label = f"{policy}_{cap}"
             if label not in rs.summaries:
                 continue
             s = rs.summaries[label].iloc[0].to_dict()
-            lines.append(
-                f"| {POLICY_LABELS.get(policy, policy)} | {cap} | "
-                f"{int(s.get('lookups', 0))} | "
-                f"{s.get('hit_rate', 0):.3f} | "
-                f"{s.get('shared_hit_rate', 0):.3f} | "
-                f"{s.get('p50_latency_ms', 0):.0f} | "
-                f"{s.get('p99_latency_ms', 0):.0f} | "
-                f"{s.get('goodput', 0):.2f} |"
-            )
+            lines.append(row(policy, cap, s))
+    # Follow-up runs (--label-suffix), if any: same columns, variant tagged.
+    variants = []
+    for label in sorted(rs.summaries):
+        p, c, v = _split_policy_and_capacity(label)
+        if v and p in POLICY_ORDER and c in ("constrained", "generous"):
+            variants.append((p, c, v, label))
+    if variants:
+        lines.append("")
+        lines.append("### Follow-up runs (--label-suffix)")
+        lines.append("")
+        for p, c, v, label in variants:
+            s = rs.summaries[label].iloc[0].to_dict()
+            s["_variant"] = v
+            lines.append(row(p, c, s))
     lines.append("")
     lines.append("## Diagnostic questions to address in the writeup")
     lines.append("")

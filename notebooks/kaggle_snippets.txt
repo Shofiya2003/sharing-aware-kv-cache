@@ -23,3 +23,10 @@ print("zipped OK")
 
 # 5. Rerun one matrix cell with a different workload seed (example: sharing-aware / constrained)
 !cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy sharing-aware --capacity constrained --num-sessions 15 --sim-window 300 --seed 1 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2000 --hit-latency-threshold-ms 797 --max-num-seqs 4 --max-new-tokens 24 --speed-factor 10
+
+# 6. Follow-up runs that coexist with the base matrix: add --label-suffix
+# (reseed repeat of one cell; result lands in summary_*_s1.csv, plotted dashed)
+!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy sharing-aware --capacity constrained --num-sessions 15 --sim-window 300 --seed 1 --label-suffix _s1 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2000 --hit-latency-threshold-ms 797 --max-num-seqs 4 --max-new-tokens 24 --speed-factor 10
+
+# 7. Alpha sweep for combined (example: alpha=0.25, constrained only)
+!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy combined --capacity constrained --combined-alpha 0.25 --num-sessions 15 --sim-window 300 --seed 0 --label-suffix _a025 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2000 --hit-latency-threshold-ms 797 --max-num-seqs 4 --max-new-tokens 24 --speed-factor 10
