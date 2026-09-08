@@ -262,7 +262,12 @@ def plot_ablation_bar(rs: RunSet, out_path: str) -> None:
             label = f"{policy}_{cap}"
             if label in rs.summaries:
                 s = rs.summaries[label].iloc[0].to_dict()
-                rows.append({"policy": policy, "capacity": cap, **s})
+                # NOTE: s contains "policy": <run_label> (e.g.
+                # "fifo_constrained"), which must NOT overwrite the short
+                # policy name — a previous version spread **s last, the
+                # reindex below matched nothing, and the chart rendered
+                # empty axes.
+                rows.append({**s, "policy": policy, "capacity": cap})
     if not rows:
         return
     df = pd.DataFrame(rows)
