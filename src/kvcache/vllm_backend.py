@@ -168,11 +168,24 @@ class VLLMBackend:
         except Exception as e:  # noqa: BLE001
             msg = str(e)
             hint = ""
-            if "memory" in msg.lower() or "cuda" in msg.lower() or "oom" in msg.lower():
+            low = msg.lower()
+            if "memory" in low or "cuda" in low or "oom" in low:
                 hint = (" HINT: vLLM could not allocate with "
                         f"gpu_memory_utilization={self.cfg.gpu_memory_utilization}. "
                         "On a 16GB T4 try --gpu-memory 0.4-0.5 for Phase 1, "
                         "lower --max-model-len (e.g. 2048), or pass enforce_eager=True.")
+            elif ("failed to be inspected" in low or "inductor" in low
+                    or "dynamo" in low or "cutedsl" in low):
+                hint = (" HINT: vLLM could not even inspect the model "
+                        "architecture — the torch install itself is internally "
+                        "inconsistent (e.g. mixed torch versions after a Kaggle "
+                        "image update + partial downgrade; symptom: ImportError "
+                        "inside torch._inductor). Fix: Run -> Restart Session, "
+                        "re-run launcher cells 1-2 (fresh pinned install), then "
+                        "verify with: python -c "
+                        "\"import torch._inductor.compile_fx; print('inductor OK')\". "
+                        "If it still fails, paste the cell-2 version lines and "
+                        "we will re-pin torch/vLLM to the new image.")
             raise VLLMUnavailable(f"vLLM engine failed to start: {e!r}.{hint}") from e
         self._started = True
         print(f"[vllm] engine started OK: model={self.cfg.model}")
