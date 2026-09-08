@@ -1,0 +1,2 @@
+policy,lookups,hits,misses,shared_hits,hit_rate,shared_hit_rate,p50_latency_ms,p99_latency_ms,goodput
+fifo_constrained,582,323,259,102,0.5549828178694158,0.28254847645429365,778.5854340000924,8279.75572043002,0.9862542955326461

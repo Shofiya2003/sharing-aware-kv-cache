@@ -1,0 +1,2 @@
+policy,lookups,hits,misses,shared_hits,hit_rate,shared_hit_rate,p50_latency_ms,p99_latency_ms,goodput
+combined_generous,582,405,177,87,0.6958762886597938,0.32954545454545453,712.3455285000091,1168.4795540798036,0.993127147766323
