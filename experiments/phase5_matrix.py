@@ -20,6 +20,7 @@ import sys
 import time
 
 from kvcache.bench import BenchConfig, MockVLLMBackend, run_benchmark
+from kvcache.analysis import ensure_base_results
 from kvcache.vllm_backend import BackendConfig, VLLMBackend
 from kvcache.workload import WorkloadConfig, generate_workload
 
@@ -145,6 +146,7 @@ async def main() -> int:
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    ensure_base_results(args.output_dir)
 
     workload = generate_workload(
         WorkloadConfig(

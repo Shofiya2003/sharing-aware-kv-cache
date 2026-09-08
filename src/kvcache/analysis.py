@@ -404,6 +404,38 @@ def write_interpretation(rs: RunSet, out_path: str) -> None:
         f.write("\n".join(lines))
 
 
+def ensure_base_results(csv_dir: str) -> int:
+    """Copy frozen experiment-1 CSVs into `csv_dir` when it has none.
+
+    Fresh Kaggle/Colab sessions start with an empty working dir, while the
+    base matrix is archived on GitHub under
+    `result_from_first_experiment/csv/`. Without this, cell 3b would redo
+    the hour-long base matrix and analysis would find nothing. Fires only
+    when `csv_dir` contains no `summary_*.csv` yet, so partial local runs
+    are never touched. Set `KVCACHE_NO_RESTORE=1` to disable (clean redo).
+    Returns the number of files restored.
+    """
+    import glob as _glob
+    import shutil as _shutil
+
+    if os.environ.get("KVCACHE_NO_RESTORE"):
+        return 0
+    if _glob.glob(os.path.join(csv_dir, "summary_*.csv")):
+        return 0
+    arch = os.path.normpath(os.path.join(
+        os.path.abspath(csv_dir), "..", "..",
+        "result_from_first_experiment", "csv"))
+    srcs = sorted(_glob.glob(os.path.join(arch, "*.csv")))
+    if not srcs:
+        return 0
+    os.makedirs(csv_dir, exist_ok=True)
+    for f in srcs:
+        _shutil.copy(f, os.path.join(csv_dir, os.path.basename(f)))
+    print(f"[results] restored {len(srcs)} experiment-1 CSVs from {arch} "
+          f"(base runs show as done; KVCACHE_NO_RESTORE=1 disables this)")
+    return len(srcs)
+
+
 def run_analysis(csv_dir: str, fig_dir: str) -> None:
     """Top-level entry point. Loads CSVs, emits all charts + interpretation."""
     rs = RunSet.load(csv_dir)

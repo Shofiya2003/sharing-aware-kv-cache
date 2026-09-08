@@ -238,6 +238,21 @@ class TestAnalysisLabels(unittest.TestCase):
             ("fifo", "generous", "_s1"),
         )
 
+    def test_ensure_base_results_restores_once(self):
+        import tempfile  # noqa: E402
+        from kvcache.analysis import ensure_base_results  # noqa: E402
+        with tempfile.TemporaryDirectory() as repo:
+            arch = os.path.join(repo, "result_from_first_experiment", "csv")
+            os.makedirs(arch)
+            with open(os.path.join(arch, "summary_fifo_constrained.csv"), "w") as f:
+                f.write("policy,hit_rate\nfifo_constrained,0.5\n")
+            csv_dir = os.path.join(repo, "results", "csv")
+            self.assertEqual(ensure_base_results(csv_dir), 1)
+            self.assertTrue(os.path.exists(
+                os.path.join(csv_dir, "summary_fifo_constrained.csv")))
+            # second call is a no-op (dir no longer empty of summaries)
+            self.assertEqual(ensure_base_results(csv_dir), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
