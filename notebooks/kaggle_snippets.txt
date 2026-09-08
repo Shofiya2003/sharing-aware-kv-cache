@@ -17,3 +17,9 @@ print("zipped OK")
 
 # 3. Re-run Phase 1 calibration (after pulling latest main)
 !cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/phase1_smoke.py --gpu-memory 0.3 --burst 10
+
+# 4. Back up a finished matrix BEFORE any rerun (reruns overwrite same filenames)
+!cd /kaggle/working/sharing-aware-kv-cache && mv results/csv results/csv_seed0 && mkdir results/csv
+
+# 5. Rerun one matrix cell with a different workload seed (example: sharing-aware / constrained)
+!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy sharing-aware --capacity constrained --num-sessions 15 --sim-window 300 --seed 1 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2000 --hit-latency-threshold-ms 797 --max-num-seqs 4 --max-new-tokens 24 --speed-factor 10
