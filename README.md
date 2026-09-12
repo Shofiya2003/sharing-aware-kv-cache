@@ -97,14 +97,69 @@ Default α = 0.5. Sweep α in `phase5_matrix.py --combined-alpha <v>` to find th
 
 The policies operate on a `QueuedRequest` priority queue: the driver re-scores the queue before each submission. This means a request that *becomes* more valuable (because a new live session now shares its n-grams) can be re-promoted in real time.
 
-## Hit/miss classification
+## Hit/miss classification — ground truth, not a proxy
 
-vLLM does not currently expose per-request cache hit/miss counters in a stable, queryable way. We use **observed latency** as a proxy:
+We read vLLM's own per-request prefix-cache counter, `num_cached_tokens` on
+`RequestOutput`: the number of prompt tokens served from an existing KV block
+instead of being prefilled.
 
-- A request that served in `< hit_latency_threshold_ms` is treated as a cache hit (mostly prefix-cache reuse, very few tokens to prefill)
-- A request above the threshold is a miss (full prefill)
+**Headline metric** (token-level, what the charts and tables report):
 
-Calibrate the threshold on your actual hardware with `experiments/phase1_smoke.py`, which prints recommended values.
+```
+cached_token_rate = sum(num_cached_tokens) / sum(n_prompt_tokens)
+```
+
+This is the same quantity vLLM reports internally as
+`gpu_prefix_cache_hit_rate`. Every run logs the engine's own value next to
+ours as `engine_prefix_cache_hit_rate` in `summary_<label>.csv`; if the two
+disagree materially, the run is not trustworthy and should not be reported.
+
+**Per-request binary** (used only for the per-session fairness ECDF): a
+request is a hit when `num_cached_tokens / n_prompt_tokens >=
+hit_cached_fraction` (default 0.10, so trivial block-boundary reuse does not
+register as a hit).
+
+Every output row carries a `hit_basis` column: `cached_tokens` means ground
+truth, `latency_proxy` means this vLLM build reported no counter and the
+numbers are **not** cache hit rates. The run log prints a loud warning in
+that case.
+
+### Why not latency (and why the first round of results was wrong)
+
+An earlier version of this harness had no ground-truth counter and
+thresholded end-to-end latency instead, at 797 ms. That does not work here,
+and the results it produced are not comparable to the current ones:
+
+- With `max_new_tokens=24`, latency is dominated by decode, not prefill. The
+  entire steady-state distribution was a single mode spanning ~660–1100 ms.
+- A threshold placed inside that mode measures *instantaneous batch queueing*,
+  not cache reuse. In one run, window 6 (p50 = 710 ms) scored a hit rate of
+  1.00 while window 8 (p50 = 870 ms) scored 0.19 — a 160 ms shift in median
+  latency swinging the reported "hit rate" by 0.81. No cache behaves that way.
+
+The proxy is still computed and published as a clearly-labelled
+`proxy_hit_rate` column, so the gap between it and ground truth is visible
+rather than hidden.
+
+## Two other corrections that came with this
+
+**Requests now carry the full conversation.** `TurnEvent.context_tokens` is
+the accumulated session history; earlier only the current turn's 32–96 tokens
+were submitted. With no shared prefix between a session's turns there was
+nothing for the prefix cache to reuse, and the total KV footprint was far too
+small for `gpu_memory_utilization` to create any eviction pressure — so both
+premises of the experiment were absent from the workload. Mean prompt length
+goes from ~109 to ~1,980 tokens; peak live contexts now total ~1.1 GB of KV
+against ~1.7 GB available at `gpu_memory_utilization=0.3`.
+
+**Warmup windows are excluded from run summaries.** The first window of a run
+carries one-time model-load and CUDA-graph-capture cost. Because
+`phase5_matrix.py` iterates policy-major, FIFO ran first and absorbed it,
+which is the entire reason FIFO appeared to have an 8x worse P99 (8280 ms vs
+~1000 ms) in the first round. Excluding warmup, max P99 beyond window 1 was
+1125 ms for FIFO against 1028 ms for sharing-aware — no tail-latency
+advantage at all. Warmup windows are still written to the time series, flagged
+`is_warmup=1`, so nothing is hidden.
 
 
 ## Key results to report
@@ -126,15 +181,15 @@ The headline metrics:
 ## Design choices (the things you should re-read before cold-emailing a PI)
 
 1. **We do not modify vLLM.** The dispatch layer operates purely on submission order. This is a deliberate architectural choice — see the spec's "Architectural correction from earlier drafts" section. The contribution is *how* you use vLLM under pressure, not what vLLM does internally.
-2. **Latency-as-hit-proxy is honest.** vLLM doesn't expose per-request hit/miss; we use latency, calibrated on the target hardware. The threshold is reported in every run's logs.
+2. **Hit/miss is ground truth.** We read vLLM's per-request `num_cached_tokens` and cross-check against the engine's own `gpu_prefix_cache_hit_rate`. Every row carries a `hit_basis` column so a run that lost ground truth cannot be mistaken for one that has it. The old latency proxy is published beside it, labelled, for comparison only.
 3. **Time-windowed metrics are mandatory.** The phenomenon is about behavior over sustained, irregular concurrency, not a single snapshot. Every run is bucketed at 30 sim seconds.
 4. **Incremental result writing.** Free-tier GPU sessions can disconnect mid-matrix. Per-run CSVs are flushed at the end of each run, so a disconnect doesn't lose completed work.
 
 
 ## Limitations / honest notes
 
-- The `MockVLLMBackend` is for development only. It does not model prefix caching. Real vLLM behavior, especially under memory pressure, can differ qualitatively.
-- Per-session hit rate from the latency proxy is approximate. For ground truth, run with vLLM's internal cache stats logging if you have the vLLM build that supports it.
+- The `MockVLLMBackend` models an LRU prefix-block pool sized off `gpu_memory_utilization`, so it exercises the ground-truth code path on CPU and responds to capacity pressure. It is still a model: its hashing is strictly prefix-aligned and it does not model batching or preemption. Real vLLM under memory pressure can differ qualitatively.
+- vLLM's prefix cache can only reuse a **contiguous prefix from token 0**. Our workload attaches shared documents at random positions (`shared_attach_position="random"`), so mid-context shared content is detected by our overlap index but is *by construction* invisible to vLLM's cache. Run `--shared-attach-position prefix` to get the case vLLM can actually exploit; the contrast between the two is itself a result worth reporting.
 - We do not sweep `num_shared_docs` or `overlap_fraction` in the main 8-run matrix. Those ablations are out of scope per the spec ("keep to 4 policies and 2 capacity levels").
 - If the combined policy does NOT clearly beat both single-signal baselines, that is a *legitimate finding*. Report it and diagnose.
 

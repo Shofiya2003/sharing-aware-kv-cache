@@ -112,12 +112,80 @@ class RequestResult:
     n_prompt_tokens: int
     error: Optional[str] = None
 
+    # --- Ground-truth prefix-cache accounting (vLLM V1) -------------------
+    # `num_cached_tokens` is the number of prompt tokens vLLM served from
+    # an existing KV-cache block instead of prefilling. This is the real
+    # per-request hit/miss signal; it replaces the old latency proxy.
+    #   -1  => the engine did not report it (old vLLM, or V0 engine).
+    #    0  => full prefill, nothing reused (a true miss).
+    #   >0  => that many prompt tokens were reused (a true hit).
+    num_cached_tokens: int = -1
+    # Where we read the counter from, for provenance in the writeup.
+    cached_tokens_source: str = ""
+
     @property
     def latency_ms(self) -> float:
         """Wall-clock latency in milliseconds (end-to-end)."""
         if self.error:
             return 0.0
         return (self.complete_t - self.submit_wall_t) * 1000.0
+
+    @property
+    def has_cache_ground_truth(self) -> bool:
+        return self.num_cached_tokens >= 0
+
+    @property
+    def cached_fraction(self) -> float:
+        """Fraction of this request's prompt that was served from cache.
+
+        0.0 for a full prefill, ->1.0 when almost the whole prompt was
+        reused. Returns 0.0 when the engine reported no counter, so
+        callers must gate on `has_cache_ground_truth` first.
+        """
+        if self.num_cached_tokens <= 0 or self.n_prompt_tokens <= 0:
+            return 0.0
+        return min(1.0, self.num_cached_tokens / self.n_prompt_tokens)
+
+
+def extract_num_cached_tokens(output: Any) -> tuple:
+    """Pull vLLM's ground-truth prefix-cache counter off a RequestOutput.
+
+    Returns `(num_cached_tokens, source)`, or `(-1, "")` when this vLLM
+    build does not report it.
+
+    vLLM exposes how many prompt tokens were served from an existing KV
+    block rather than prefilled. Where it lives moved around across
+    versions, so we probe in order of preference:
+
+      1. `RequestOutput.num_cached_tokens`  -- V1 engine (vLLM >= 0.8),
+         the stable public field. This is what we expect on 0.10.x.
+      2. `RequestOutput.metrics.num_cached_tokens` -- some V0 builds
+         surfaced it on the per-request metrics object.
+      3. `RequestOutput.outputs[0].num_cached_tokens` -- defensive; a
+         couple of builds hung it off the CompletionOutput.
+
+    We deliberately do NOT guess from timings. If none of these exist we
+    return -1 and the caller refuses to report a hit rate, rather than
+    silently falling back to a latency threshold (which is what made the
+    first round of results uninterpretable).
+    """
+    v = getattr(output, "num_cached_tokens", None)
+    if isinstance(v, int) and v >= 0:
+        return v, "RequestOutput.num_cached_tokens"
+
+    m = getattr(output, "metrics", None)
+    if m is not None:
+        v = getattr(m, "num_cached_tokens", None)
+        if isinstance(v, int) and v >= 0:
+            return v, "RequestOutput.metrics.num_cached_tokens"
+
+    outs = getattr(output, "outputs", None)
+    if outs:
+        v = getattr(outs[0], "num_cached_tokens", None)
+        if isinstance(v, int) and v >= 0:
+            return v, "CompletionOutput.num_cached_tokens"
+
+    return -1, ""
 
 
 class VLLMBackend:
@@ -129,6 +197,10 @@ class VLLMBackend:
         self._started = False
         self._pending: Dict[str, asyncio.Future] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
+        # Provenance for the cache counter: set on the first completion.
+        # None = not yet observed, "" = this build does not report it.
+        self.cached_tokens_source: Optional[str] = None
+        self._warned_no_cache_counter = False
 
     async def start(self) -> None:
         print(f"[vllm] starting engine: model={self.cfg.model} "
@@ -240,6 +312,8 @@ class VLLMBackend:
             text_chunks: List[str] = []
             n_out = 0
             n_prompt = 0
+            n_cached = -1
+            cache_src = ""
             try:
                 async for output in self.engine.generate(  # type: ignore[attr-defined]
                     prompt, sp, request_id=request_id
@@ -254,9 +328,21 @@ class VLLMBackend:
                         if output.prompt_token_ids is not None
                         else n_prompt
                     )
+                    # Ground-truth prefix-cache counter. Read it on every
+                    # chunk and keep the largest value seen: vLLM sets it
+                    # once the prompt has been scheduled, so early chunks
+                    # of a streamed response can still report 0.
+                    c, src = extract_num_cached_tokens(output)
+                    if c > n_cached:
+                        n_cached = c
+                        cache_src = src
+                    elif n_cached < 0 and c == 0:
+                        n_cached = 0
+                        cache_src = src
                     if output.finished:
                         break
                 complete_wall = time.monotonic()
+                self._note_cache_source(cache_src)
                 result = RequestResult(
                     request_id=request_id,
                     text="".join(text_chunks),
@@ -266,6 +352,8 @@ class VLLMBackend:
                     complete_t=complete_wall,
                     n_output_tokens=n_out,
                     n_prompt_tokens=n_prompt,
+                    num_cached_tokens=n_cached,
+                    cached_tokens_source=cache_src,
                 )
                 if not fut.done():
                     fut.set_result(result)
@@ -276,6 +364,50 @@ class VLLMBackend:
         self._tasks[request_id] = asyncio.create_task(_run())
         return request_id
 
+
+    def _note_cache_source(self, src: str) -> None:
+        """Record (once) where the cache counter came from, and warn if absent."""
+        if self.cached_tokens_source is None:
+            self.cached_tokens_source = src
+            if src:
+                print(f"[vllm] prefix-cache ground truth available via {src}")
+            else:
+                print("[vllm] WARNING: this vLLM build does not report "
+                      "num_cached_tokens on RequestOutput. Hit rate cannot be "
+                      "measured directly; the run will be marked "
+                      "hit_basis=unavailable.")
+        elif src and not self.cached_tokens_source:
+            # A later request found it after an earlier one did not.
+            self.cached_tokens_source = src
+
+    def prefix_cache_hit_rate(self) -> Optional[float]:
+        """Engine-level prefix-cache hit rate, as a cross-check.
+
+        vLLM tracks a cumulative `gpu_prefix_cache_hit_rate` (queries vs.
+        hits, in blocks) inside the engine. We read it opportunistically
+        so the writeup can show that the per-request token counters we sum
+        agree with the engine's own accounting. Returns None when the
+        attribute chain is not present on this build.
+        """
+        eng = self.engine
+        if eng is None:
+            return None
+        for path in (
+            ("engine", "scheduler", 0, "kv_cache_manager",
+             "block_pool", "get_prefix_cache_hit_rate"),
+            ("engine", "scheduler", "kv_cache_manager", "block_pool",
+             "get_prefix_cache_hit_rate"),
+        ):
+            node: Any = eng
+            try:
+                for step in path:
+                    node = node[step] if isinstance(step, int) else getattr(node, step)
+                val = node()
+                if isinstance(val, (int, float)):
+                    return float(val)
+            except Exception:  # noqa: BLE001
+                continue
+        return None
 
     async def wait(self, request_id: str, timeout: Optional[float] = None) -> RequestResult:
         fut = self._pending[request_id]

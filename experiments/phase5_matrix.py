@@ -57,6 +57,8 @@ async def run_one(
         speed_factor=cfg_template.speed_factor,
         sla_latency_ms=cfg_template.sla_latency_ms,
         hit_latency_threshold_ms=cfg_template.hit_latency_threshold_ms,
+        hit_cached_fraction=cfg_template.hit_cached_fraction,
+        discard_warmup_windows=cfg_template.discard_warmup_windows,
         output_dir=output_dir,
         run_label=label,
     )
@@ -104,6 +106,9 @@ async def main() -> int:
     p.add_argument("--num-sessions", type=int, default=15)
     p.add_argument("--sim-window", type=float, default=300.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--combined-alpha", type=float, default=0.5,
+                   help="Weight on the session signal in the combined policy; "
+                        "(1-alpha) goes to the sharing signal.")
     p.add_argument("--max-num-seqs", type=int, default=4)
     p.add_argument(
         "--generous-gpu-mem",
@@ -124,7 +129,31 @@ async def main() -> int:
     )
     p.add_argument("--speed-factor", type=float, default=10.0)
     p.add_argument("--sla-latency-ms", type=float, default=2500.0)
-    p.add_argument("--hit-latency-threshold-ms", type=float, default=300.0)
+    p.add_argument("--hit-latency-threshold-ms", type=float, default=300.0,
+                   help="LEGACY latency proxy. Only emits the proxy_hit_rate "
+                        "diagnostic column; does not define hit/miss.")
+    p.add_argument("--hit-cached-fraction", type=float, default=0.10,
+                   help="A request is a hit when at least this fraction of its "
+                        "prompt tokens were served from cache (ground truth).")
+    p.add_argument("--discard-warmup-windows", type=int, default=1,
+                   help="Leading time windows excluded from the run summary as "
+                        "engine warmup. Keeps run order out of the headline P99.")
+    p.add_argument("--shared-attach-position", default="random",
+                   choices=["prefix", "mid", "random"],
+                   help="Where cross-session shared content lands in a prompt. "
+                        "vLLM can only reuse a contiguous prefix from token 0, "
+                        "so 'prefix' is the case its cache can exploit and "
+                        "'random'/'mid' is the harder, more realistic case.")
+    p.add_argument("--overlap-fraction", type=float, default=0.6,
+                   help="Fraction of sessions that reference shared documents.")
+    p.add_argument("--num-shared-docs", type=int, default=4)
+    p.add_argument("--max-context-tokens", type=int, default=3072,
+                   help="Per-session context window. Requests carry the whole "
+                        "conversation so far, capped here.")
+    p.add_argument("--no-accumulate-context", action="store_true",
+                   help="Submit only each turn's delta instead of the full "
+                        "conversation. Reproduces the old (broken) behavior "
+                        "where there was no prefix for the cache to reuse.")
     p.add_argument("--output-dir", default="results/csv")
     p.add_argument(
         "--mock",
@@ -153,6 +182,11 @@ async def main() -> int:
             num_sessions=args.num_sessions,
             sim_window_s=args.sim_window,
             seed=args.seed,
+            accumulate_context=not args.no_accumulate_context,
+            max_context_tokens=args.max_context_tokens,
+            shared_attach_position=args.shared_attach_position,
+            overlap_fraction=args.overlap_fraction,
+            num_shared_docs=args.num_shared_docs,
         )
     )
     print(
@@ -172,6 +206,9 @@ async def main() -> int:
         speed_factor=args.speed_factor,
         sla_latency_ms=args.sla_latency_ms,
         hit_latency_threshold_ms=args.hit_latency_threshold_ms,
+        hit_cached_fraction=args.hit_cached_fraction,
+        discard_warmup_windows=args.discard_warmup_windows,
+        combined_alpha=args.combined_alpha,
     )
 
     pairs = []
@@ -206,6 +243,8 @@ async def main() -> int:
                 speed_factor=base_cfg.speed_factor,
                 sla_latency_ms=base_cfg.sla_latency_ms,
                 hit_latency_threshold_ms=base_cfg.hit_latency_threshold_ms,
+                hit_cached_fraction=base_cfg.hit_cached_fraction,
+                discard_warmup_windows=base_cfg.discard_warmup_windows,
             )
             pairs.append((policy, cap_name, cfg))
             print(f"[phase5] queued run: {policy}_{cap_name} (gpu_mem={gpu_mem})")

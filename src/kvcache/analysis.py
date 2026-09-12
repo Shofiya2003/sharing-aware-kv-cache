@@ -135,17 +135,25 @@ def _filter(rs: RunSet, policy: str, capacity: str) -> Optional[pd.DataFrame]:
 
 
 def plot_headline_hit_rate(rs: RunSet, out_path: str, capacity: str = "constrained") -> None:
-    """Real cache hit rate over time, all 4 policies, on one chart.
+    """Token-level prefix-cache hit rate over time, all 4 policies.
 
-    This is the headline chart for the project. Under constrained capacity,
-    we expect the policies to separate.
+    This is the headline chart. The plotted quantity is
+    `cached_token_rate` = cached_tokens / prompt_tokens, read straight from
+    vLLM's per-request `num_cached_tokens`. Warmup windows are shaded out:
+    they carry one-time engine startup cost, not policy behavior.
+
+    Falls back to the legacy `hit_rate` column only for older CSVs that
+    predate ground-truth measurement, and says so in the axis label.
     """
     plt.figure(figsize=(10, 5))
     plotted = 0
+    metric = None
     for policy in POLICY_ORDER:
         for variant, _label, df in _matching(rs, policy, capacity):
+            col = "cached_token_rate" if "cached_token_rate" in df.columns else "hit_rate"
+            metric = metric or col
             # Use a rolling mean to smooth out single-window noise
-            smoothed = df["hit_rate"].rolling(window=2, min_periods=1).mean()
+            smoothed = df[col].rolling(window=2, min_periods=1).mean()
             plt.plot(
                 df["t_start"],
                 smoothed,
@@ -158,9 +166,25 @@ def plot_headline_hit_rate(rs: RunSet, out_path: str, capacity: str = "constrain
     if plotted == 0:
         plt.close()
         return
+    # Shade the warmup region so it is never read as a policy effect.
+    for _v, _l, df in _matching(rs, POLICY_ORDER[0], capacity):
+        if "is_warmup" in df.columns and df["is_warmup"].any():
+            warm = df[df["is_warmup"] == 1]
+            plt.axvspan(float(warm["t_start"].min()),
+                        float(warm["t_end"].max()),
+                        color="0.85", alpha=0.6, zorder=0)
+            plt.text(float(warm["t_start"].min()), 0.02, " warmup (excluded)",
+                     fontsize=8, color="0.35", va="bottom")
+        break
     plt.xlabel("Simulated time (s)")
-    plt.ylabel("Cache hit rate (rolling)")
-    plt.title(f"Real cache hit rate over time — {capacity} capacity")
+    if metric == "cached_token_rate":
+        plt.ylabel("Prefix-cache hit rate (cached tokens / prompt tokens)")
+        plt.title(f"Prefix-cache hit rate over time — {capacity} capacity\n"
+                  f"ground truth: vLLM num_cached_tokens")
+    else:
+        plt.ylabel("Hit rate (LEGACY latency proxy — not ground truth)")
+        plt.title(f"Hit rate over time — {capacity} capacity "
+                  f"(legacy latency proxy)")
     plt.legend(loc="best")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -341,17 +365,37 @@ def write_interpretation(rs: RunSet, out_path: str) -> None:
         "This is a draft of the headline result table. Fill in narrative "
         "around it.\n"
     )
-    lines.append("| Policy | Capacity | Lookups | Hit rate | Shared hit rate | P50 (ms) | P99 (ms) | Goodput |")
-    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    lines.append(
+        "**Primary metric is `cached_tok`** — vLLM's own per-request "
+        "`num_cached_tokens` summed over prompt tokens "
+        "(`cached_tokens / prompt_tokens`). `req_hit` is the per-request "
+        "binary used for the fairness ECDF. `proxy` is what the old, "
+        "discredited latency threshold would have reported on the same "
+        "requests; it is shown only so the gap is visible. `trunc` is the "
+        "share of requests whose prefix was invalidated by hitting the "
+        "context window (a miss cause unrelated to the policy). Summaries "
+        "exclude warmup windows.\n"
+    )
+    lines.append(
+        "| Policy | Capacity | Reqs | cached_tok | shared_cached_tok | "
+        "req_hit | P50 (ms) | P99 (ms) | trunc | proxy | basis |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+
     def row(policy: str, cap: str, s: dict) -> str:
+        basis = str(s.get("hit_basis", "?"))
+        flag = "" if basis == "cached_tokens" else " **(NOT ground truth)**"
         return (
             f"| {_legend_name(policy, s.pop('_variant', ''))} | {cap} | "
             f"{int(s.get('lookups', 0))} | "
+            f"{s.get('cached_token_rate', float('nan')):.3f} | "
+            f"{s.get('shared_cached_token_rate', float('nan')):.3f} | "
             f"{s.get('hit_rate', 0):.3f} | "
-            f"{s.get('shared_hit_rate', 0):.3f} | "
             f"{s.get('p50_latency_ms', 0):.0f} | "
             f"{s.get('p99_latency_ms', 0):.0f} | "
-            f"{s.get('goodput', 0):.2f} |"
+            f"{s.get('context_truncated_rate', float('nan')):.2f} | "
+            f"{s.get('proxy_hit_rate', float('nan')):.3f} | "
+            f"{basis}{flag} |"
         )
 
     for policy in POLICY_ORDER:
@@ -376,11 +420,39 @@ def write_interpretation(rs: RunSet, out_path: str) -> None:
             s["_variant"] = v
             lines.append(row(p, c, s))
     lines.append("")
+    lines.append("## Validity checks — do these FIRST")
+    lines.append("")
+    lines.append(
+        "- Is `basis` = `cached_tokens` for every row? If any row says "
+        "`latency_proxy`, that run has no usable hit rate and must not be "
+        "reported as one."
+    )
+    lines.append(
+        "- Does `cached_tok` agree with `engine_prefix_cache_hit_rate` in the "
+        "summary CSV? They measure the same thing two different ways; a large "
+        "gap means the per-request counters are being read wrong."
+    )
+    lines.append(
+        "- How far apart are `cached_tok` and `proxy`? A large gap is the "
+        "evidence that the old latency-threshold results were measuring "
+        "queueing jitter rather than cache reuse."
+    )
+    lines.append(
+        "- Does **generous** beat **constrained** for the same policy? If not, "
+        "the capacity lever is not binding and the constrained/generous axis "
+        "carries no signal."
+    )
+    lines.append(
+        "- Is `trunc` similar across policies? If one policy truncates far "
+        "more, part of its miss rate is the context window, not the policy."
+    )
+    lines.append("")
     lines.append("## Diagnostic questions to address in the writeup")
     lines.append("")
     lines.append(
         "- Does the **Combined** policy beat both single-signal baselines on "
-        "the constrained-capacity hit rate? By how much?"
+        "the constrained-capacity `cached_tok`? By how much, and is the gap "
+        "larger than the seed-to-seed spread?"
     )
     lines.append(
         "- Does the advantage shrink or disappear at the **generous** capacity? "
@@ -404,15 +476,42 @@ def write_interpretation(rs: RunSet, out_path: str) -> None:
         f.write("\n".join(lines))
 
 
-def ensure_base_results(csv_dir: str) -> int:
-    """Copy frozen experiment-1 CSVs into `csv_dir` when it has none.
+def summary_has_ground_truth(path: str) -> bool:
+    """True when a summary CSV was produced with ground-truth hit measurement.
 
-    Fresh Kaggle/Colab sessions start with an empty working dir, while the
-    base matrix is archived on GitHub under
-    `result_from_first_experiment/csv/`. Without this, cell 3b would redo
-    the hour-long base matrix and analysis would find nothing. Fires only
-    when `csv_dir` contains no `summary_*.csv` yet, so partial local runs
-    are never touched. Set `KVCACHE_NO_RESTORE=1` to disable (clean redo).
+    Pre-ground-truth summaries have no `hit_basis` column at all (their hit
+    rate came from a latency threshold). Those must never be mixed with
+    current runs or restored as if they were done.
+    """
+    import csv as _csv
+
+    try:
+        with open(path, newline="") as fh:
+            row = next(iter(_csv.DictReader(fh)), None)
+    except OSError:
+        return False
+    if row is None:
+        return False
+    return row.get("hit_basis") == "cached_tokens"
+
+
+def ensure_base_results(csv_dir: str) -> int:
+    """Copy frozen archived CSVs into `csv_dir` when it has none.
+
+    Fresh Kaggle/Colab sessions start with an empty working dir, while an
+    earlier matrix may be archived under `result_from_first_experiment/csv/`.
+    Restoring it lets the runner skip work it has already done.
+
+    IMPORTANT: we only restore archives that carry ground-truth hit
+    measurement (`hit_basis=cached_tokens`). The experiment-1 archive does
+    not: its hit rates came from a 797 ms latency threshold. Restoring it
+    would be actively harmful, because the runner's "skip what's already
+    done" check keys on `summary_<label>.csv` existing -- so stale,
+    invalid runs would cause the new matrix to be skipped entirely and the
+    analysis would silently report the old numbers.
+
+    Fires only when `csv_dir` contains no `summary_*.csv` yet, so partial
+    local runs are never touched. Set `KVCACHE_NO_RESTORE=1` to disable.
     Returns the number of files restored.
     """
     import glob as _glob
@@ -428,10 +527,23 @@ def ensure_base_results(csv_dir: str) -> int:
     srcs = sorted(_glob.glob(os.path.join(arch, "*.csv")))
     if not srcs:
         return 0
+
+    summaries = [f for f in srcs if os.path.basename(f).startswith("summary_")]
+    legacy = [f for f in summaries if not summary_has_ground_truth(f)]
+    if legacy:
+        print(f"[results] NOT restoring {len(srcs)} CSVs from {arch}: "
+              f"{len(legacy)}/{len(summaries)} summaries predate ground-truth "
+              f"hit measurement (no hit_basis=cached_tokens).")
+        print("[results] Those runs used a latency-threshold hit proxy and are "
+              "superseded. Restoring them would make the runner skip the new "
+              "matrix and the analysis report the old numbers. Re-run the "
+              "matrix instead.")
+        return 0
+
     os.makedirs(csv_dir, exist_ok=True)
     for f in srcs:
         _shutil.copy(f, os.path.join(csv_dir, os.path.basename(f)))
-    print(f"[results] restored {len(srcs)} experiment-1 CSVs from {arch} "
+    print(f"[results] restored {len(srcs)} CSVs from {arch} "
           f"(base runs show as done; KVCACHE_NO_RESTORE=1 disables this)")
     return len(srcs)
 
@@ -445,6 +557,25 @@ def run_analysis(csv_dir: str, fig_dir: str) -> None:
     print(
         f"[analysis] loaded {len(rs.runs)} runs: {sorted(rs.runs.keys())}"
     )
+
+    # Refuse to silently mix measurement regimes. A legacy run's "hit rate"
+    # is a latency threshold; a current run's is vLLM's cached-token
+    # counter. Plotting them on one axis would be meaningless.
+    legacy, current = [], []
+    for label, df in rs.summaries.items():
+        row = df.iloc[0].to_dict() if len(df) else {}
+        (current if row.get("hit_basis") == "cached_tokens" else legacy).append(label)
+    if legacy and current:
+        print("\n[analysis] *** MIXED MEASUREMENT REGIMES IN ONE DIRECTORY ***")
+        print(f"[analysis] ground truth ({len(current)}): {sorted(current)}")
+        print(f"[analysis] LEGACY latency-proxy ({len(legacy)}): {sorted(legacy)}")
+        print("[analysis] These are not comparable. Move the legacy CSVs out of")
+        print("[analysis] this directory before reporting anything from it.")
+    elif legacy and not current:
+        print("\n[analysis] WARNING: every run here predates ground-truth hit")
+        print("[analysis] measurement. The 'hit rate' in these charts is a")
+        print("[analysis] latency threshold, NOT a cache hit rate.")
+
     for cap in ("constrained", "generous"):
         plot_headline_hit_rate(rs, os.path.join(fig_dir, f"headline_hit_rate_{cap}.png"), capacity=cap)
         plot_p99_latency(rs, os.path.join(fig_dir, f"p99_latency_{cap}.png"), capacity=cap)

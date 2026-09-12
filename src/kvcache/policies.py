@@ -123,10 +123,14 @@ class SessionAwarePolicy(DispatchPolicy):
 
 def _sharing_count(q: QueuedRequest, overlap_index: OverlapIndex, cap: int = 20) -> int:
     """Count distinct other sessions whose referenced n-grams overlap with
-    this request's tokens. Used by SharingAwarePolicy and CombinedPolicy.
+    this request's prompt. Used by SharingAwarePolicy and CombinedPolicy.
+
+    Scores the full accumulated prompt (`prompt_tokens`), not just this
+    turn's delta, so that sharing inherited from earlier turns still counts
+    -- the prompt is what occupies cache blocks.
     """
     other_sids = set()
-    for gram in ngrams(q.event.tokens, overlap_index.n):
+    for gram in ngrams(q.event.prompt_tokens, overlap_index.n):
         gid = ngram_id(gram)
         for sid in overlap_index._refs.get(gid, ()):  # noqa: SLF001
             if sid != q.event.session_id:

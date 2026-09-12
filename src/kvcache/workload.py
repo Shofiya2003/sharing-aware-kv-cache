@@ -54,6 +54,16 @@ class WorkloadConfig:
     turn_min_tokens: int = 32
     turn_max_tokens: int = 96
 
+    # Multi-turn context. Each request carries the session's whole history
+    # so far, like a real chat API call. This is what grows the per-session
+    # KV footprint over time and gives the prefix cache something to reuse.
+    accumulate_context: bool = True
+    # Hard cap on prompt length, mirroring a real deployment's context
+    # window. When a session exceeds it we drop its oldest turns, which
+    # necessarily invalidates that session's cached prefix -- the generator
+    # flags those events so the analysis can account for them.
+    max_context_tokens: int = 3072
+
     # Cross-session content overlap
     # Defaults are tuned so that, on a 10-20 session workload, the
     # expected number of pairs of sharing sessions that pick the *same*
@@ -73,7 +83,20 @@ class WorkloadConfig:
 
 @dataclass
 class TurnEvent:
-    """One turn to be submitted to vLLM."""
+    """One turn to be submitted to vLLM.
+
+    `tokens` is this turn's NEW content only (the delta). `context_tokens`
+    is what actually gets sent to the engine: the whole conversation so
+    far, including this turn -- which is how real multi-turn chat serving
+    works and is the only reason a prefix cache has anything to reuse.
+
+    An earlier version submitted `tokens` alone, i.e. ~32-96 tokens per
+    request with no history. That made every request an independent short
+    prompt, so (a) there was no growing per-session context to protect,
+    and (b) the total KV footprint was far too small for
+    `gpu_memory_utilization` to ever create eviction pressure. Both of
+    those are premises the experiment depends on.
+    """
 
     session_id: str
     turn_index: int
@@ -81,6 +104,17 @@ class TurnEvent:
     tokens: Tuple[int, ...]
     role: str
     is_active: bool
+    # Full accumulated prompt for this turn. Defaults to `tokens` so older
+    # callers still work, but the generator always populates it.
+    context_tokens: Tuple[int, ...] = ()
+    # True when the session's history was trimmed to fit
+    # `max_context_tokens`, which resets prefix reuse for that session.
+    context_truncated: bool = False
+
+    @property
+    def prompt_tokens(self) -> Tuple[int, ...]:
+        """What to actually submit to the engine."""
+        return self.context_tokens if self.context_tokens else self.tokens
 
 
 @dataclass
@@ -167,6 +201,32 @@ def generate_workload(cfg: WorkloadConfig) -> Workload:
                 turn = Turn(turn_index=turn_idx, t=t, tokens=turn_toks, role=role)
                 sess.turns.append(turn)
                 sess.last_turn_t = t
+
+                # Build the prompt actually sent to the engine: the whole
+                # conversation so far. The leading turns are byte-identical
+                # to the previous request from this session, which is
+                # exactly the prefix vLLM can reuse.
+                if cfg.accumulate_context:
+                    ctx = tuple(tok for tn in sess.turns for tok in tn.tokens)
+                    truncated = False
+                    if len(ctx) > cfg.max_context_tokens:
+                        # Context window overflow: drop oldest turns, as a
+                        # real chat app would. This shifts the prefix and
+                        # so costs this session its cached blocks.
+                        keep: list = []
+                        total = 0
+                        for tn in reversed(sess.turns):
+                            if total + len(tn.tokens) > cfg.max_context_tokens:
+                                break
+                            keep.append(tn)
+                            total += len(tn.tokens)
+                        keep.reverse()
+                        ctx = tuple(tok for tn in keep for tok in tn.tokens)
+                        truncated = True
+                else:
+                    ctx = turn_toks
+                    truncated = False
+
                 events.append(
                     TurnEvent(
                         session_id=sid,
@@ -175,6 +235,8 @@ def generate_workload(cfg: WorkloadConfig) -> Workload:
                         tokens=turn_toks,
                         role=role,
                         is_active=True,
+                        context_tokens=ctx,
+                        context_truncated=truncated,
                     )
                 )
                 turn_idx += 1

@@ -186,33 +186,199 @@ class TestBenchIntegration(unittest.TestCase):
 
 
 class TestMetrics(unittest.TestCase):
+    @staticmethod
+    def _rec(i, submit_t, n_prompt=20, n_cached=0, hit=True, shared=False,
+             latency_ms=100):
+        return RequestRecord(
+            request_id=f"r{i}",
+            session_id="s0",
+            turn_index=i,
+            submit_t=submit_t,
+            complete_t=submit_t + 0.1,
+            latency_ms=latency_ms,
+            n_prompt_tokens=n_prompt,
+            n_output_tokens=10,
+            hit=hit,
+            shared=shared,
+            policy_name="fifo",
+            capacity_setting="constrained",
+            in_flight_at_submit=1,
+            num_cached_tokens=n_cached,
+            hit_basis="cached_tokens",
+            proxy_hit=latency_ms <= 300,
+        )
+
     def test_metrics_logger_writes_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
-            m = MetricsLogger(MetricsConfig(output_dir=tmp, run_label="x"))
+            m = MetricsLogger(
+                MetricsConfig(output_dir=tmp, run_label="x",
+                              discard_warmup_windows=0)
+            )
             for i in range(3):
-                m.record(
-                    RequestRecord(
-                        request_id=f"r{i}",
-                        session_id="s0",
-                        turn_index=i,
-                        submit_t=i * 5.0,
-                        complete_t=i * 5.0 + 0.1,
-                        latency_ms=100,
-                        n_prompt_tokens=20,
-                        n_output_tokens=10,
-                        hit=True,
-                        shared=False,
-                        policy_name="fifo",
-                        capacity_setting="constrained",
-                        in_flight_at_submit=1,
-                    )
-                )
+                m.record(self._rec(i, i * 5.0, n_cached=10))
             m.flush_window(0)
             s = m.finalize(sim_window_s=30.0)
             self.assertEqual(s["lookups"], 3)
             self.assertTrue(os.path.exists(os.path.join(tmp, "time_series_x.csv")))
             self.assertTrue(os.path.exists(os.path.join(tmp, "per_session_x.csv")))
             self.assertTrue(os.path.exists(os.path.join(tmp, "summary_x.csv")))
+
+    def test_cached_token_rate_is_token_weighted(self):
+        """Headline metric must weight by tokens, not average per-request."""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = MetricsLogger(
+                MetricsConfig(output_dir=tmp, run_label="tw",
+                              discard_warmup_windows=0)
+            )
+            # One long request with no reuse, one short one fully reused.
+            # Token-weighted rate = 10 / 1010, NOT the 0.5 you would get
+            # by averaging per-request fractions.
+            m.record(self._rec(0, 0.0, n_prompt=1000, n_cached=0))
+            m.record(self._rec(1, 1.0, n_prompt=10, n_cached=10))
+            s = m.finalize(sim_window_s=30.0)
+            self.assertEqual(s["prompt_tokens"], 1010)
+            self.assertEqual(s["cached_tokens"], 10)
+            self.assertAlmostEqual(s["cached_token_rate"], 10 / 1010, places=6)
+            self.assertEqual(s["hit_basis"], "cached_tokens")
+            self.assertAlmostEqual(s["cache_ground_truth_coverage"], 1.0)
+
+    def test_warmup_windows_excluded_from_summary(self):
+        """Window 0 must not be allowed to set the headline P99."""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = MetricsLogger(
+                MetricsConfig(output_dir=tmp, run_label="w",
+                              discard_warmup_windows=1, window_s=30.0)
+            )
+            # One pathological warmup request (model load) in window 0...
+            m.record(self._rec(0, 1.0, latency_ms=56_000))
+            # ...and clean steady-state traffic in window 1.
+            for i in range(1, 11):
+                m.record(self._rec(i, 30.0 + i, latency_ms=700))
+            s = m.finalize(sim_window_s=60.0)
+            self.assertEqual(s["lookups"], 10)
+            self.assertEqual(s["n_records_all"], 11)
+            self.assertEqual(s["n_warmup_windows_discarded"], 1)
+            self.assertLess(s["p99_latency_ms"], 1000)
+            # The warmup window is still written out, just flagged.
+            ts = open(os.path.join(tmp, "time_series_w.csv")).read().splitlines()
+            self.assertIn("is_warmup", ts[0])
+            self.assertEqual(ts[1].split(",")[3], "1")
+            self.assertEqual(ts[2].split(",")[3], "0")
+
+    def test_proxy_hit_rate_reported_separately(self):
+        """The old latency metric is published beside ground truth, not as it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = MetricsLogger(
+                MetricsConfig(output_dir=tmp, run_label="p",
+                              discard_warmup_windows=0,
+                              hit_latency_threshold_ms=300)
+            )
+            # Every request reused nothing (true miss) but came back fast,
+            # so the latency proxy would have called all of them hits.
+            for i in range(4):
+                m.record(self._rec(i, i * 1.0, n_cached=0, hit=False,
+                                   latency_ms=100))
+            s = m.finalize(sim_window_s=30.0)
+            self.assertEqual(s["cached_token_rate"], 0.0)
+            self.assertEqual(s["hit_rate"], 0.0)
+            self.assertEqual(s["proxy_hit_rate"], 1.0)
+
+
+class TestCacheGroundTruth(unittest.TestCase):
+    """The fix that matters: hit/miss comes from vLLM, not from latency."""
+
+    def test_extractor_prefers_request_output_field(self):
+        from kvcache.vllm_backend import extract_num_cached_tokens
+
+        class Out:
+            num_cached_tokens = 48
+
+        self.assertEqual(
+            extract_num_cached_tokens(Out()),
+            (48, "RequestOutput.num_cached_tokens"),
+        )
+
+    def test_extractor_falls_back_through_metrics(self):
+        from kvcache.vllm_backend import extract_num_cached_tokens
+
+        class M:
+            num_cached_tokens = 16
+
+        class Out:
+            metrics = M()
+
+        n, src = extract_num_cached_tokens(Out())
+        self.assertEqual(n, 16)
+        self.assertIn("metrics", src)
+
+    def test_extractor_returns_minus_one_when_absent(self):
+        """Must refuse to guess. -1 is what marks a run uninterpretable."""
+        from kvcache.vllm_backend import extract_num_cached_tokens
+
+        class Out:
+            outputs = []
+            metrics = None
+
+        self.assertEqual(extract_num_cached_tokens(Out()), (-1, ""))
+
+    def test_request_result_cached_fraction(self):
+        from kvcache.vllm_backend import RequestResult
+
+        r = RequestResult(
+            request_id="r", text="", submit_t=0.0, submit_wall_t=0.0,
+            first_token_t=0.0, complete_t=0.0, n_output_tokens=4,
+            n_prompt_tokens=200, num_cached_tokens=50,
+        )
+        self.assertTrue(r.has_cache_ground_truth)
+        self.assertAlmostEqual(r.cached_fraction, 0.25)
+
+        miss = RequestResult(
+            request_id="r", text="", submit_t=0.0, submit_wall_t=0.0,
+            first_token_t=0.0, complete_t=0.0, n_output_tokens=4,
+            n_prompt_tokens=200, num_cached_tokens=0,
+        )
+        self.assertTrue(miss.has_cache_ground_truth)
+        self.assertEqual(miss.cached_fraction, 0.0)
+
+        unknown = RequestResult(
+            request_id="r", text="", submit_t=0.0, submit_wall_t=0.0,
+            first_token_t=0.0, complete_t=0.0, n_output_tokens=4,
+            n_prompt_tokens=200,
+        )
+        self.assertFalse(unknown.has_cache_ground_truth)
+
+    def test_mock_prefix_cache_reuses_repeated_prefix(self):
+        from kvcache.bench import MockVLLMBackend
+        from kvcache.vllm_backend import BackendConfig
+
+        b = MockVLLMBackend(BackendConfig(gpu_memory_utilization=0.7))
+        prompt = " ".join(f"w{i%37}" for i in range(320))
+        first, n = b._lookup_and_insert(prompt)
+        self.assertEqual(first, 0)  # cold: nothing to reuse
+        second, _ = b._lookup_and_insert(prompt)
+        self.assertGreater(second, 0)  # warm: prefix is resident
+        self.assertLessEqual(second, n)
+
+    def test_mock_prefix_cache_evicts_under_pressure(self):
+        """Constrained capacity must actually lose blocks. The lever has to bite."""
+        from kvcache.bench import MockVLLMBackend
+        from kvcache.vllm_backend import BackendConfig
+
+        def reuse_after_churn(gpu_mem):
+            b = MockVLLMBackend(BackendConfig(gpu_memory_utilization=gpu_mem))
+            target = " ".join(f"t{i}" for i in range(320))
+            b._lookup_and_insert(target)
+            # Churn lots of unrelated traffic through the pool.
+            for k in range(60):
+                b._lookup_and_insert(" ".join(f"x{k}_{i}" for i in range(320)))
+            again, _ = b._lookup_and_insert(target)
+            return again, b.n_evictions
+
+        tight, eviction_tight = reuse_after_churn(0.02)
+        roomy, _ = reuse_after_churn(0.9)
+        self.assertGreater(eviction_tight, 0)
+        self.assertEqual(tight, 0)         # evicted under pressure
+        self.assertGreater(roomy, 0)       # survived with headroom
 
 
 class TestAnalysisLabels(unittest.TestCase):
@@ -238,20 +404,68 @@ class TestAnalysisLabels(unittest.TestCase):
             ("fifo", "generous", "_s1"),
         )
 
-    def test_ensure_base_results_restores_once(self):
+    @staticmethod
+    def _make_archive(repo, body):
+        arch = os.path.join(repo, "result_from_first_experiment", "csv")
+        os.makedirs(arch, exist_ok=True)
+        with open(os.path.join(arch, "summary_fifo_constrained.csv"), "w") as f:
+            f.write(body)
+        return os.path.join(repo, "results", "csv")
+
+    def test_ensure_base_results_restores_ground_truth_archive(self):
         import tempfile  # noqa: E402
         from kvcache.analysis import ensure_base_results  # noqa: E402
         with tempfile.TemporaryDirectory() as repo:
-            arch = os.path.join(repo, "result_from_first_experiment", "csv")
-            os.makedirs(arch)
-            with open(os.path.join(arch, "summary_fifo_constrained.csv"), "w") as f:
-                f.write("policy,hit_rate\nfifo_constrained,0.5\n")
-            csv_dir = os.path.join(repo, "results", "csv")
+            csv_dir = self._make_archive(
+                repo,
+                "policy,hit_rate,hit_basis\n"
+                "fifo_constrained,0.5,cached_tokens\n",
+            )
             self.assertEqual(ensure_base_results(csv_dir), 1)
             self.assertTrue(os.path.exists(
                 os.path.join(csv_dir, "summary_fifo_constrained.csv")))
             # second call is a no-op (dir no longer empty of summaries)
             self.assertEqual(ensure_base_results(csv_dir), 0)
+
+    def test_ensure_base_results_refuses_legacy_archive(self):
+        """A latency-proxy archive must NOT be restored.
+
+        If it were, the runner's "skip finished labels" check would see
+        summary_<label>.csv and skip the whole new matrix, and the analysis
+        would report the superseded numbers as if they were fresh.
+        """
+        import tempfile  # noqa: E402
+        from kvcache.analysis import ensure_base_results  # noqa: E402
+        with tempfile.TemporaryDirectory() as repo:
+            csv_dir = self._make_archive(
+                repo, "policy,hit_rate\nfifo_constrained,0.5\n"
+            )
+            self.assertEqual(ensure_base_results(csv_dir), 0)
+            self.assertFalse(os.path.exists(
+                os.path.join(csv_dir, "summary_fifo_constrained.csv")))
+
+    def test_summary_has_ground_truth(self):
+        import tempfile  # noqa: E402
+        from kvcache.analysis import summary_has_ground_truth  # noqa: E402
+        with tempfile.TemporaryDirectory() as d:
+            gt = os.path.join(d, "gt.csv")
+            with open(gt, "w") as f:
+                f.write("policy,hit_basis\nx,cached_tokens\n")
+            self.assertTrue(summary_has_ground_truth(gt))
+
+            old = os.path.join(d, "old.csv")
+            with open(old, "w") as f:
+                f.write("policy,hit_rate\nx,0.5\n")
+            self.assertFalse(summary_has_ground_truth(old))
+
+            fallback = os.path.join(d, "fb.csv")
+            with open(fallback, "w") as f:
+                f.write("policy,hit_basis\nx,latency_proxy\n")
+            self.assertFalse(summary_has_ground_truth(fallback))
+
+            self.assertFalse(
+                summary_has_ground_truth(os.path.join(d, "missing.csv"))
+            )
 
 
 if __name__ == "__main__":

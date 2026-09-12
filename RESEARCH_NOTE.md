@@ -25,12 +25,33 @@ Four dispatch policies are evaluated:
 - **Sharing-aware** — prioritize requests whose content is referenced by multiple live sessions.
 - **Combined** — weighted sum of the two signals, with α swept.
 
-Per-request outcome is classified as a hit or miss using observed latency, calibrated on the target hardware. We log time-windowed (30 s buckets) cache hit rate, P50/P99 latency, goodput, and per-session hit rates (for fairness analysis). Results are written incrementally per run to survive free-tier session disconnects.
+Each request carries the session's full accumulated conversation, as a real chat API call does; this is what grows the per-session KV footprint over time and gives the prefix cache something to reuse. With 15 sessions over a 300 s window, mean prompt length is ~1,980 tokens and peak live contexts total ~1.1 GB of KV — against ~1.7 GB available at `gpu_memory_utilization=0.3`, so the capacity lever binds.
+
+Per-request outcome is measured, not inferred: we read vLLM's own `num_cached_tokens` from each `RequestOutput` — the number of prompt tokens served from an existing KV block rather than prefilled. The headline metric is token-level, `sum(num_cached_tokens) / sum(n_prompt_tokens)`, the same quantity vLLM reports as `gpu_prefix_cache_hit_rate`; the engine's own value is logged beside ours every run as a cross-check. A per-request binary (cached fraction ≥ 0.10) is used only for the per-session fairness ECDF. Every row carries a `hit_basis` column, so a run on a vLLM build that reports no counter is marked unusable rather than silently falling back.
+
+We log time-windowed (30 s buckets) prefix-cache hit rate, P50/P99 latency, goodput, per-session hit rates, and the share of requests whose prefix was invalidated by hitting the context window. The first window of each run is excluded from the summary as engine warmup (model load, CUDA graph capture) but still written out, flagged. Results are written incrementally per run to survive free-tier session disconnects.
+
+### Measurement corrections from the first round
+
+The first round of results is superseded and not comparable. Three defects, in order of severity:
+
+1. **Latency was used as a hit proxy** (threshold 797 ms). With `max_new_tokens=24` the latency distribution is decode-dominated — a single mode spanning ~660–1100 ms — so a threshold inside it measured batch-queueing jitter, not cache reuse. A 160 ms shift in median latency moved the reported "hit rate" from 1.00 to 0.19.
+2. **Requests carried only the current turn** (32–96 tokens), not the conversation. With no shared prefix across a session's turns there was nothing for the prefix cache to reuse, and the KV footprint was far too small for `gpu_memory_utilization` to create eviction pressure. Both premises of the experiment were absent from the workload.
+3. **Warmup contaminated the headline P99.** `phase5_matrix.py` iterates policy-major, so FIFO ran first and absorbed one-time engine startup. Excluding warmup, FIFO's max P99 was 1125 ms against sharing-aware's 1028 ms — the apparent 8x tail-latency win (8280 ms vs 1012 ms) was entirely run order.
 
 
 ## 4. Ablation finding (placeholder — fill in after the GPU run)
 
 [Replace this section with the actual numbers from `results/INTERPRETATION.md`. The headline chart is `results/figures/headline_hit_rate_constrained.png`; the ablation bars are `results/figures/ablation_bars.png`.]
+
+Before writing anything here, clear the validity checks at the top of
+`INTERPRETATION.md`: `hit_basis` must read `cached_tokens` on every row, our
+`cached_token_rate` must agree with the engine's own
+`engine_prefix_cache_hit_rate`, and **generous must beat constrained for the
+same policy** — if it does not, the capacity axis carries no signal and no
+claim about behavior "under pressure" is supported. Report effect sizes
+against the seed-to-seed spread across at least three seeds, not against
+zero.
 
 **Expected pattern, based on the design:**
 - At *generous* capacity, all four policies converge — there's enough KV-cache headroom that submission order barely matters.
@@ -40,7 +61,8 @@ Per-request outcome is classified as a hit or miss using observed latency, calib
 ## 5. Limitations
 
 - **Single-node, single model.** The contribution is *how* you use vLLM under pressure, not what vLLM does internally. Distributed setups like Preble's are explicitly out of scope.
-- **Latency-as-hit-proxy.** vLLM does not currently expose per-request cache hit/miss. We use a calibrated latency threshold. Real per-block hit counters would be strictly better; that is a vLLM-engine-side change we are not making.
+- **Prefix-alignment is a hard constraint, not a measurement choice.** vLLM's prefix cache reuses only a *contiguous prefix from token 0*. Our overlap detector is alignment-robust and finds shared content wherever it sits, but content the detector flags mid-context cannot be reused by the engine no matter how we schedule. Measured directly: moving shared docs to the prompt prefix raises the hit rate from ~0.58 to ~0.88. So a sharing-aware *scheduler* can only exploit sharing that happens to be prefix-aligned; exploiting mid-context sharing would require an engine-side change (block-level dedup) that is explicitly out of scope here. This is the sharpest limitation of the approach and should be stated first in any writeup.
+- **Context-window truncation is a confound.** ~28% of requests hit the 3072-token cap and have their session prefix invalidated. That is realistic (real chat apps do this) but it is a miss cause unrelated to the policy, so it is tracked and reported as `context_truncated_rate`.
 - **Modest session count.** Free-tier GPU quota caps us at 10–20 concurrent sessions. Production serving systems see 10²–10³ concurrent sessions; the qualitative behavior should hold, but the absolute numbers will differ.
 - **Single model.** We use Qwen2.5-1.5B-Instruct. Behavior with much larger models (where KV-cache memory is even more constrained) is an open question.
 
@@ -54,7 +76,8 @@ Per-request outcome is classified as a hit or miss using observed latency, calib
 
 ## 7. Resume framing (draft bullets, fill in real numbers)
 
-- Built a request-scheduling layer on top of vLLM that prioritizes concurrent LLM session dispatch by session activity and cross-session content-sharing signals, measured against FIFO baseline on real hardware.
-- Designed and ran a benchmark simulating 15–20 concurrent, irregularly active chat/agent sessions against a real vLLM serving instance under constrained GPU cache memory, measuring real cache hit rate, latency, and goodput; combined scheduling signals improved [metric] by [X]% over single-signal baselines at [condition].
-- Implemented alignment-robust cross-session content overlap detection to identify shareable KV-cache content across dynamically growing multi-turn contexts.
+- Built a request-scheduling layer on top of vLLM that prioritizes concurrent LLM session dispatch by session activity and cross-session content-sharing signals, measured against a FIFO baseline on real hardware using vLLM's own per-request prefix-cache counters.
+- Designed and ran a benchmark simulating 15–20 concurrent, irregularly active multi-turn chat sessions against a real vLLM instance under constrained GPU KV-cache memory, measuring prefix-cache hit rate, latency, and goodput across [N] seeds; [result, including a negative one if that is what the data says].
+- Implemented alignment-robust cross-session content overlap detection, and quantified the gap between detectable sharing and *exploitable* sharing given that vLLM reuses only contiguous prompt prefixes (hit rate ~0.58 random placement vs ~0.88 prefix-aligned).
+- Found and corrected three measurement defects in an earlier round of the same experiment — a latency-threshold hit proxy standing in for cache instrumentation, prompts that omitted conversation history, and engine warmup contaminating tail-latency numbers — each of which had produced a result that did not survive re-measurement.
 
