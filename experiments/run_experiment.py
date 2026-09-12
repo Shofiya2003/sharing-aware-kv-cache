@@ -124,6 +124,8 @@ async def amain(args) -> int:
             shared_doc_max_tokens=args.shared_doc_max_tokens,
             turn_min_tokens=args.turn_min_tokens,
             turn_max_tokens=args.turn_max_tokens,
+            mean_active_burst_turns=args.mean_active_burst_turns,
+            mean_idle_gap_s=args.mean_idle_gap_s,
         )
     )
     print(
@@ -200,6 +202,12 @@ def main() -> int:
     p.add_argument("--shared-doc-max-tokens", type=int, default=192)
     p.add_argument("--turn-min-tokens", type=int, default=32)
     p.add_argument("--turn-max-tokens", type=int, default=96)
+    p.add_argument("--mean-active-burst-turns", type=float, default=4.0,
+                   help="Mean turns per active burst. Lower values grow "
+                        "contexts more slowly and so reduce context-window "
+                        "truncation, which is a confound on reuse.")
+    p.add_argument("--mean-idle-gap-s", type=float, default=25.0,
+                   help="Mean idle gap between a session's bursts.")
     p.add_argument("--max-context-tokens", type=int, default=3072,
                    help="Per-session context window. Requests carry the whole "
                         "conversation so far, capped here.")
