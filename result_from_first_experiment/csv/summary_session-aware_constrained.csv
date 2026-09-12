@@ -1,2 +1,0 @@
-policy,lookups,hits,misses,shared_hits,hit_rate,shared_hit_rate,p50_latency_ms,p99_latency_ms,goodput
-session-aware_constrained,582,352,230,99,0.6048109965635738,0.3009118541033435,769.7838479999746,1118.7724813399973,0.9914089347079038

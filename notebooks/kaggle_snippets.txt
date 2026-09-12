@@ -1,16 +1,37 @@
 # Kaggle one-liners (paste each into its own notebook cell and run)
+#
+# ROUND 2. Every snippet below uses the round-2 configuration. The round-1
+# flags are NOT here on purpose:
+#   --max-num-seqs 4      -> almost no serving concurrency or cache pressure
+#   --hit-latency-threshold-ms 797 as the hit definition -> not a cache metric
+# Hit/miss now comes from vLLM's per-request num_cached_tokens. The threshold
+# is still passed, but only to emit the labelled proxy_hit_rate column.
 
-# 0. Fresh session: pull latest + restore archived base CSVs (no-clobber:
-# existing/partial runs are kept). After this, cell 3b shows all 8 as done.
-!cd /kaggle/working/sharing-aware-kv-cache && git pull --ff-only && mkdir -p results/csv && cp -n result_from_first_experiment/csv/*.csv results/csv/ && ls results/csv/summary_*.csv | wc -l
+# --- the shared config block used by every run below -----------------------
+# --num-sessions 15 --sim-window 300
+# --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3
+# --sla-latency-ms 2500
+# --hit-cached-fraction 0.10 --discard-warmup-windows 1
+# --max-context-tokens 3072
+# --max-num-seqs 16 --max-new-tokens 24 --speed-factor 10
+# --hit-latency-threshold-ms 797      (diagnostic column only)
+
+# 0. Fresh session: pull latest code. Do NOT restore round-1 CSVs -- cell 3b
+# skips any label that already has a summary_<label>.csv, so stale files make
+# the new matrix silently skip and the old numbers get reported as fresh.
+!cd /kaggle/working/sharing-aware-kv-cache && git pull --ff-only && mkdir -p results/csv && ls results/csv/summary_*.csv 2>/dev/null | wc -l
+
+# 0b. Check every finished run actually captured ground truth. Any row that is
+# not hit_basis=cached_tokens has no usable hit rate and must not be reported.
+!cd /kaggle/working/sharing-aware-kv-cache && python -c "import csv,glob,os;[print(f'{os.path.basename(f)[8:-4]:44s} {next(iter(csv.DictReader(open(f)))).get(\"hit_basis\",\"MISSING\")}') for f in sorted(glob.glob('results/csv/summary_*.csv'))]"
 
 # 1. Pull the latest code (same as launcher cell 1, as a one-liner)
 !cd /kaggle/working/sharing-aware-kv-cache && git pull --ff-only
 
-# 2. Zip all matrix results for one-click download (option A: one-liner)
+# 2. Zip all matrix results for one-click download
 !cd /kaggle/working/sharing-aware-kv-cache && python experiments/zip_results.py --out /kaggle/working/kvcache_results.zip
 
-# 2b. Same thing as a Python cell (option B: subprocess snippet)
+# 2b. Same thing as a Python cell
 import subprocess
 subprocess.run(
     ["zip", "-r", "/kaggle/working/kvcache_results.zip",
@@ -19,31 +40,30 @@ subprocess.run(
 )
 print("zipped OK")
 
-# 8. Download experiment-2 results (same zip script — it bundles whole
-# directories, so suffixed _s1/_a025 CSVs and refreshed charts are included)
-!cd /kaggle/working/sharing-aware-kv-cache && python experiments/zip_results.py --out /kaggle/working/kvcache_results_exp2.zip
-
-# 8b. Same download as a Python cell (option B: subprocess snippet)
-import subprocess
-subprocess.run(
-    ["zip", "-r", "/kaggle/working/kvcache_results2.zip",
-     "results/csv", "results/figures", "results/INTERPRETATION.md"],
-    cwd="/kaggle/working/sharing-aware-kv-cache", check=True,
-)
-print("zipped OK")
-
-# 3. Re-run Phase 1 calibration (after pulling latest main)
+# 3. Ground-truth pre-flight. Run this BEFORE the matrix. If it fails, the
+# matrix would produce latency-threshold numbers instead of cache hit rates.
 !cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/phase1_smoke.py --gpu-memory 0.3 --burst 10
 
-# 4. Back up a finished matrix BEFORE any rerun (reruns overwrite same filenames)
-!cd /kaggle/working/sharing-aware-kv-cache && mv results/csv results/csv_seed0 && mkdir results/csv
+# 4. Back up a finished matrix BEFORE any rerun (reruns overwrite filenames)
+!cd /kaggle/working/sharing-aware-kv-cache && mv results/csv results/csv_backup_$(date +%H%M) && mkdir -p results/csv
 
-# 5. Rerun one matrix cell with a different workload seed (example: sharing-aware / constrained)
-!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy sharing-aware --capacity constrained --num-sessions 15 --sim-window 300 --seed 1 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2000 --hit-latency-threshold-ms 797 --max-num-seqs 4 --max-new-tokens 24 --speed-factor 10
+# 5. One matrix cell, one seed. Seed 0 writes the base label; any other seed
+# needs --label-suffix _s<N> or it overwrites the base run.
+!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy sharing-aware --capacity constrained --seed 1 --label-suffix _s1 --num-sessions 15 --sim-window 300 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2500 --hit-cached-fraction 0.10 --discard-warmup-windows 1 --max-context-tokens 3072 --max-num-seqs 16 --max-new-tokens 24 --speed-factor 10 --hit-latency-threshold-ms 797
 
-# 6. Follow-up runs that coexist with the base matrix: add --label-suffix
-# (reseed repeat of one cell; result lands in summary_*_s1.csv, plotted dashed)
-!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy sharing-aware --capacity constrained --num-sessions 15 --sim-window 300 --seed 1 --label-suffix _s1 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2000 --hit-latency-threshold-ms 797 --max-num-seqs 4 --max-new-tokens 24 --speed-factor 10
+# 6. THE KEY ABLATION: how much of the detected sharing can vLLM actually
+# reuse? vLLM reuses only a contiguous prefix from token 0, so shared content
+# placed mid-context is visible to our overlap index but unusable by the
+# engine. Compare this against the matching base run.
+!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy sharing-aware --capacity constrained --seed 0 --label-suffix _prefixalign --shared-attach-position prefix --num-sessions 15 --sim-window 300 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2500 --hit-cached-fraction 0.10 --discard-warmup-windows 1 --max-context-tokens 3072 --max-num-seqs 16 --max-new-tokens 24 --speed-factor 10 --hit-latency-threshold-ms 797
 
 # 7. Alpha sweep for combined (example: alpha=0.25, constrained only)
-!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy combined --capacity constrained --combined-alpha 0.25 --num-sessions 15 --sim-window 300 --seed 0 --label-suffix _a025 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2000 --hit-latency-threshold-ms 797 --max-num-seqs 4 --max-new-tokens 24 --speed-factor 10
+!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy combined --capacity constrained --combined-alpha 0.25 --seed 0 --label-suffix _a025 --num-sessions 15 --sim-window 300 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2500 --hit-cached-fraction 0.10 --discard-warmup-windows 1 --max-context-tokens 3072 --max-num-seqs 16 --max-new-tokens 24 --speed-factor 10 --hit-latency-threshold-ms 797
+
+# 8. CONTROL: reproduce round 1's workload (turn deltas only, no conversation
+# history). cached_token_rate should collapse toward 0 -- that is the direct
+# demonstration that round 1 had no reusable prefix at all.
+!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy fifo --capacity constrained --seed 0 --label-suffix _nocontext --no-accumulate-context --num-sessions 15 --sim-window 300 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2500 --hit-cached-fraction 0.10 --discard-warmup-windows 1 --max-context-tokens 3072 --max-num-seqs 16 --max-new-tokens 24 --speed-factor 10 --hit-latency-threshold-ms 797
+
+# 9. More sharing to work with: does sharing-awareness pay off at higher overlap?
+!cd /kaggle/working/sharing-aware-kv-cache && PYTHONPATH=src VLLM_LOGGING_LEVEL=WARNING python experiments/run_experiment.py --policy sharing-aware --capacity constrained --seed 0 --label-suffix _ov09 --overlap-fraction 0.9 --num-sessions 15 --sim-window 300 --generous-gpu-mem 0.7 --constrained-gpu-mem 0.3 --sla-latency-ms 2500 --hit-cached-fraction 0.10 --discard-warmup-windows 1 --max-context-tokens 3072 --max-num-seqs 16 --max-new-tokens 24 --speed-factor 10 --hit-latency-threshold-ms 797

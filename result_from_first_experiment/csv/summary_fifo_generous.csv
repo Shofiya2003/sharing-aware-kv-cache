@@ -1,2 +1,0 @@
-policy,lookups,hits,misses,shared_hits,hit_rate,shared_hit_rate,p50_latency_ms,p99_latency_ms,goodput
-fifo_generous,582,375,207,126,0.6443298969072165,0.3783783783783784,760.1774849999856,7284.576002169956,0.9862542955326461

@@ -1,2 +1,0 @@
-policy,lookups,hits,misses,shared_hits,hit_rate,shared_hit_rate,p50_latency_ms,p99_latency_ms,goodput
-sharing-aware_generous,582,380,202,62,0.6529209621993127,0.23484848484848486,724.0855840000222,1847.2532318700628,0.993127147766323

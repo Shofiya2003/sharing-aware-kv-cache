@@ -47,7 +47,7 @@ The design tension under study: an eviction / scheduling policy based only on **
 ├── notebooks/
 │   └── kaggle_launcher.ipynb     # Thin GPU launcher
 ├── tests/test_core.py            # 14 unit + integration tests
-├── results/                      # CSVs and figures (per-run)
+├── results/                      # CSVs and figures (per-run, gitignored)
 ├── README.md                     # this file
 ├── RESEARCH_NOTE.md              # 1-2 page research note
 ├── pyproject.toml
