@@ -284,6 +284,107 @@ class TestMetrics(unittest.TestCase):
             self.assertEqual(s["proxy_hit_rate"], 1.0)
 
 
+class TestSharedContentAlignment(unittest.TestCase):
+    """Cross-session reuse needs a common prefix from token 0.
+
+    vLLM chains block hashes from the first token, so two sessions only share
+    cache if their prompts match from position 0. These tests pin the two
+    workload modes that make that testable, and the volume-matched control
+    that isolates alignment from token count.
+    """
+
+    BIG = dict(num_sessions=12, sim_window_s=200, seed=0,
+               shared_doc_min_tokens=800, shared_doc_max_tokens=1200,
+               num_shared_docs=2, overlap_fraction=0.8,
+               turn_min_tokens=16, turn_max_tokens=48,
+               max_context_tokens=3900)
+
+    @staticmethod
+    def _common_prefix(a, b):
+        n = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            n += 1
+        return n
+
+    def _cross_session_reuse(self, position):
+        import itertools
+        from collections import defaultdict
+        from kvcache.workload import generate_workload, WorkloadConfig  # noqa: E402
+
+        w = generate_workload(
+            WorkloadConfig(shared_attach_position=position, **self.BIG)
+        )
+        by = defaultdict(list)
+        for e in w.events:
+            by[e.session_id].append(e)
+        for v in by.values():
+            v.sort(key=lambda e: e.turn_index)
+        heads = [evs[-1].prompt_tokens for evs in by.values()]
+        fracs = [
+            self._common_prefix(p1, p2) / max(len(p1), len(p2))
+            for p1, p2 in itertools.combinations(heads, 2)
+        ]
+        return w, fracs
+
+    def test_session_preamble_creates_cross_session_prefix(self):
+        _w, fracs = self._cross_session_reuse("session_preamble")
+        self.assertGreater(max(fracs), 0.05)
+        self.assertGreater(sum(1 for f in fracs if f > 0.001), 0)
+
+    def test_session_mid_creates_none(self):
+        """The control must yield zero cross-session reuse."""
+        _w, fracs = self._cross_session_reuse("session_mid")
+        self.assertEqual(max(fracs), 0.0)
+
+    def test_turn_prefix_is_not_a_prompt_prefix(self):
+        """'prefix' attaches to the TURN, which is mid-prompt once context
+        accumulates. This is why it cannot be used as the aligned arm."""
+        _w, fracs = self._cross_session_reuse("prefix")
+        import statistics as st
+        pre_w, pre_f = self._cross_session_reuse("session_preamble")
+        self.assertLess(st.mean(fracs), st.mean(pre_f))
+
+    def test_alignment_arms_are_volume_matched(self):
+        """session_mid vs session_preamble must differ only in alignment."""
+        mid, _ = self._cross_session_reuse("session_mid")
+        pre, _ = self._cross_session_reuse("session_preamble")
+        mid_tok = sum(len(e.prompt_tokens) for e in mid.events)
+        pre_tok = sum(len(e.prompt_tokens) for e in pre.events)
+        self.assertLess(abs(mid_tok - pre_tok) / max(mid_tok, pre_tok), 0.10)
+        mid_tr = sum(1 for e in mid.events if e.context_truncated) / len(mid.events)
+        pre_tr = sum(1 for e in pre.events if e.context_truncated) / len(pre.events)
+        self.assertLess(abs(mid_tr - pre_tr), 0.05)
+
+    def test_pinned_preamble_survives_truncation(self):
+        """Truncation must drop middle turns, never the shared preamble.
+
+        Dropping oldest-first would delete the doc at position 0 and wipe out
+        cross-session reuse for exactly the long sessions that matter most.
+        """
+        from collections import defaultdict
+        from kvcache.workload import generate_workload, WorkloadConfig  # noqa: E402
+
+        w = generate_workload(
+            WorkloadConfig(shared_attach_position="session_preamble", **self.BIG)
+        )
+        by = defaultdict(list)
+        for e in w.events:
+            by[e.session_id].append(e)
+        checked = 0
+        for evs in by.values():
+            evs.sort(key=lambda e: e.turn_index)
+            trunc = [e for e in evs if e.context_truncated]
+            if not trunc:
+                continue
+            head = evs[0].prompt_tokens[:64]
+            for e in trunc:
+                self.assertEqual(e.prompt_tokens[:64], head)
+                checked += 1
+        self.assertGreater(checked, 0, "no truncated events to verify")
+
+
 class TestCacheGroundTruth(unittest.TestCase):
     """The fix that matters: hit/miss comes from vLLM, not from latency."""
 

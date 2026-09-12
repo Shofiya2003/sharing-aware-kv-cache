@@ -34,6 +34,12 @@ class Turn:
     t: float
     tokens: Tuple[int, ...]
     role: str
+    # Pinned turns are never dropped when the context window overflows.
+    # Real deployments keep the system prompt / shared document preamble at
+    # position 0 and evict middle turns instead, which is what keeps the
+    # cacheable prefix stable. Dropping oldest-first would delete the
+    # preamble and destroy cross-session reuse entirely.
+    pinned: bool = False
 
     @property
     def size(self) -> int:

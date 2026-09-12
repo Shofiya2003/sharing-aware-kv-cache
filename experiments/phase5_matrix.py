@@ -139,14 +139,26 @@ async def main() -> int:
                    help="Leading time windows excluded from the run summary as "
                         "engine warmup. Keeps run order out of the headline P99.")
     p.add_argument("--shared-attach-position", default="random",
-                   choices=["prefix", "mid", "random"],
-                   help="Where cross-session shared content lands in a prompt. "
-                        "vLLM can only reuse a contiguous prefix from token 0, "
-                        "so 'prefix' is the case its cache can exploit and "
-                        "'random'/'mid' is the harder, more realistic case.")
+                   choices=["session_preamble", "session_mid", "prefix", "mid", "random"],
+                   help="Where cross-session shared content lands. vLLM reuses "
+                        "only a contiguous prefix from token 0, so "
+                        "'session_preamble' (doc opens the session, hence sits "
+                        "at position 0 of every prompt it issues) is the ONLY "
+                        "mode that yields cross-session reuse. 'prefix' opens "
+                        "the individual turn, which is mid-prompt once context "
+                        "accumulates. 'random'/'mid' are detectable but not "
+                        "reusable.")
     p.add_argument("--overlap-fraction", type=float, default=0.6,
                    help="Fraction of sessions that reference shared documents.")
     p.add_argument("--num-shared-docs", type=int, default=4)
+    p.add_argument("--shared-doc-min-tokens", type=int, default=64,
+                   help="Min size of a shared document. With session_preamble "
+                        "placement this is the cross-session reusable prefix, "
+                        "so it must be large relative to the conversation for "
+                        "the sharing signal to have any headroom.")
+    p.add_argument("--shared-doc-max-tokens", type=int, default=192)
+    p.add_argument("--turn-min-tokens", type=int, default=32)
+    p.add_argument("--turn-max-tokens", type=int, default=96)
     p.add_argument("--max-context-tokens", type=int, default=3072,
                    help="Per-session context window. Requests carry the whole "
                         "conversation so far, capped here.")
@@ -187,6 +199,10 @@ async def main() -> int:
             shared_attach_position=args.shared_attach_position,
             overlap_fraction=args.overlap_fraction,
             num_shared_docs=args.num_shared_docs,
+            shared_doc_min_tokens=args.shared_doc_min_tokens,
+            shared_doc_max_tokens=args.shared_doc_max_tokens,
+            turn_min_tokens=args.turn_min_tokens,
+            turn_max_tokens=args.turn_max_tokens,
         )
     )
     print(

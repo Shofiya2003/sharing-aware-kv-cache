@@ -72,7 +72,25 @@ class WorkloadConfig:
     num_shared_docs: int = 4
     shared_doc_min_tokens: int = 64
     shared_doc_max_tokens: int = 192
-    shared_attach_position: str = "random"  # "prefix" | "mid" | "random"
+    # Where cross-session shared content lands.
+    #   "session_preamble" -- the doc opens the session, so it sits at
+    #       position 0 of EVERY prompt that session issues. This is the only
+    #       mode that produces cross-session reuse, because vLLM needs a
+    #       contiguous match from token 0. It is also the realistic shared-
+    #       document / shared-system-prompt case, and the regime Preble
+    #       studied.
+    #   "prefix" -- start of the individual TURN. Note this does NOT give a
+    #       common prompt prefix once context accumulates: a doc opening
+    #       turn 5 sits at offset len(t1..t4) in the submitted prompt.
+    #       Kept for continuity; use "session_preamble" for aligned sharing.
+    #   "session_mid" -- the matched CONTROL for session_preamble: same doc,
+    #       attached once to the first turn but at a non-zero offset. Same
+    #       token volume, same prompt lengths, zero cross-session reuse. Use
+    #       this as the baseline when measuring what alignment is worth.
+    #   "mid" / "random" -- re-attached inside turns throughout the session.
+    #       Detectable by the overlap index, not reusable by the engine, and
+    #       NOT volume-matched to session_preamble.
+    shared_attach_position: str = "random"
 
     # Token universe. Tokens are ints in [0, vocab_size). These are rendered
     # to text by the backend (see `vllm_backend.token_id_to_text`).
@@ -151,6 +169,11 @@ def _maybe_attach_shared_doc(
 def generate_workload(cfg: WorkloadConfig) -> Workload:
     """Generate a deterministic workload from `cfg`."""
     rng = random.Random(cfg.seed)
+    # Shared-doc placement draws from its OWN stream so that changing
+    # `shared_attach_position` does not perturb the activity model. Without
+    # this, the aligned and control arms get different turn counts and token
+    # volumes, and the comparison stops isolating alignment.
+    place_rng = random.Random((cfg.seed << 1) ^ 0x5EED)
 
     shared_pool: List[Tuple[int, ...]] = [
         _sample_shared_doc(rng, cfg) for _ in range(cfg.num_shared_docs)
@@ -192,13 +215,54 @@ def generate_workload(cfg: WorkloadConfig) -> Workload:
                 size = rng.randint(cfg.turn_min_tokens, cfg.turn_max_tokens)
                 turn_toks = tuple(rng.randrange(cfg.vocab_size) for _ in range(size))
 
-                if sid in sharing_sids and rng.random() < 0.6:
-                    turn_toks = _maybe_attach_shared_doc(rng, cfg, turn_toks, primary_doc)
-                if sid in sharing_sids and secondary_doc and rng.random() < 0.3:
-                    turn_toks = _maybe_attach_shared_doc(rng, cfg, turn_toks, secondary_doc)
+                # NOTE: all shared-doc placement below uses `place_rng`,
+                # never `rng`, so the activity model is identical across
+                # placement modes.
+                if cfg.shared_attach_position == "session_mid":
+                    # Control arm for session_preamble: the SAME doc, attached
+                    # exactly once to the session's first turn, but at a
+                    # non-zero offset. Identical token volume and identical
+                    # prompt lengths, so the only difference from
+                    # session_preamble is whether the doc starts at token 0.
+                    # That isolates alignment from volume -- comparing against
+                    # "random" instead would confound the two, because random
+                    # re-attaches the doc on ~60% of turns and inflates
+                    # contexts (73% truncation vs 10%).
+                    if sid in sharing_sids and turn_idx == 0:
+                        off = place_rng.randint(1, max(1, len(turn_toks)))
+                        turn_toks = (turn_toks[:off] + primary_doc
+                                     + turn_toks[off:])
+                    if sid in sharing_sids and secondary_doc and place_rng.random() < 0.3:
+                        off = place_rng.randint(0, len(turn_toks))
+                        turn_toks = turn_toks[:off] + secondary_doc + turn_toks[off:]
+                elif cfg.shared_attach_position == "session_preamble":
+                    # The doc opens the session, unconditionally, so every
+                    # prompt this session issues starts with it and sessions
+                    # sharing a doc have a real common prefix from token 0.
+                    if sid in sharing_sids and turn_idx == 0:
+                        turn_toks = primary_doc + turn_toks
+                    # The secondary doc still lands mid-context, so a single
+                    # run contains both the exploitable and the merely
+                    # detectable kind of sharing.
+                    if sid in sharing_sids and secondary_doc and place_rng.random() < 0.3:
+                        off = place_rng.randint(0, len(turn_toks))
+                        turn_toks = turn_toks[:off] + secondary_doc + turn_toks[off:]
+                else:
+                    if sid in sharing_sids and place_rng.random() < 0.6:
+                        turn_toks = _maybe_attach_shared_doc(place_rng, cfg, turn_toks, primary_doc)
+                    if sid in sharing_sids and secondary_doc and place_rng.random() < 0.3:
+                        turn_toks = _maybe_attach_shared_doc(place_rng, cfg, turn_toks, secondary_doc)
 
                 role = "user" if (turn_idx % 2 == 0) else "assistant"
-                turn = Turn(turn_index=turn_idx, t=t, tokens=turn_toks, role=role)
+                # The preamble-bearing turn is pinned so context-window
+                # overflow cannot delete the shared prefix.
+                is_pinned = (
+                    cfg.shared_attach_position == "session_preamble"
+                    and sid in sharing_sids
+                    and turn_idx == 0
+                )
+                turn = Turn(turn_index=turn_idx, t=t, tokens=turn_toks,
+                            role=role, pinned=is_pinned)
                 sess.turns.append(turn)
                 sess.last_turn_t = t
 
@@ -210,18 +274,27 @@ def generate_workload(cfg: WorkloadConfig) -> Workload:
                     ctx = tuple(tok for tn in sess.turns for tok in tn.tokens)
                     truncated = False
                     if len(ctx) > cfg.max_context_tokens:
-                        # Context window overflow: drop oldest turns, as a
-                        # real chat app would. This shifts the prefix and
-                        # so costs this session its cached blocks.
+                        # Context window overflow. Keep PINNED turns at the
+                        # front (system prompt / shared preamble), then fill
+                        # with the most recent turns that fit, dropping from
+                        # the middle -- which is what real chat apps do and
+                        # what keeps the cacheable prefix stable. Dropping
+                        # oldest-first instead would delete the preamble and
+                        # wipe out cross-session reuse.
+                        pinned = [tn for tn in sess.turns if tn.pinned]
+                        total = sum(len(tn.tokens) for tn in pinned)
                         keep: list = []
-                        total = 0
                         for tn in reversed(sess.turns):
+                            if tn.pinned:
+                                continue
                             if total + len(tn.tokens) > cfg.max_context_tokens:
                                 break
                             keep.append(tn)
                             total += len(tn.tokens)
                         keep.reverse()
-                        ctx = tuple(tok for tn in keep for tok in tn.tokens)
+                        ctx = tuple(
+                            tok for tn in (pinned + keep) for tok in tn.tokens
+                        )
                         truncated = True
                 else:
                     ctx = turn_toks
