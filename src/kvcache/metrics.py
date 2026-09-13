@@ -49,6 +49,12 @@ class RequestRecord:
     # window, which invalidates that session's cached prefix. Tracked
     # because it is a legitimate cause of misses unrelated to the policy.
     context_truncated: bool = False
+    # End-to-end latency from when the user's turn became available, i.e.
+    # INCLUDING time spent waiting in the dispatch queue. `latency_ms` above
+    # excludes that wait, so it flatters policies that starve requests.
+    # Goodput is computed on this one.
+    e2e_latency_ms: float = 0.0
+    queue_wait_ms: float = 0.0
 
     @property
     def cached_fraction(self) -> float:
@@ -149,7 +155,10 @@ class MetricsLogger:
         if r.context_truncated:
             st["truncated"] += 1
         st["latencies"].append(r.latency_ms)
-        if r.latency_ms <= self.cfg.sla_latency_ms:
+        st["e2e_latencies"].append(r.e2e_latency_ms or r.latency_ms)
+        st["queue_waits"].append(r.queue_wait_ms)
+        # SLA is a user-facing promise, so it is judged on end-to-end latency.
+        if (r.e2e_latency_ms or r.latency_ms) <= self.cfg.sla_latency_ms:
             st["good"] += 1
         st["in_flight_sum"] += r.in_flight_at_submit
         if r.in_flight_at_submit > st["in_flight_max"]:
@@ -163,6 +172,8 @@ class MetricsLogger:
             "shared_hits": 0,
             "unique_hits": 0,
             "latencies": [],
+            "e2e_latencies": [],
+            "queue_waits": [],
             "good": 0,
             "in_flight_sum": 0,
             "in_flight_max": 0,
@@ -228,6 +239,9 @@ class MetricsLogger:
             f"{sctr:.6f}",
             f"{percentile(st['latencies'], 0.50):.2f}",
             f"{percentile(st['latencies'], 0.99):.2f}",
+            f"{percentile(st['e2e_latencies'], 0.50):.2f}",
+            f"{percentile(st['e2e_latencies'], 0.99):.2f}",
+            f"{percentile(st['queue_waits'], 0.50):.2f}",
             f"{goodput:.6f}",
             f"{mean_inf:.2f}",
             st["in_flight_max"],
@@ -262,6 +276,8 @@ class MetricsLogger:
                     "prompt_tokens", "cached_tokens",
                     "cached_token_rate", "shared_cached_token_rate",
                     "p50_latency_ms", "p99_latency_ms",
+                    "p50_e2e_latency_ms", "p99_e2e_latency_ms",
+                    "p50_queue_wait_ms",
                     "goodput", "mean_in_flight", "max_in_flight",
                     "proxy_hit_rate",
                 ]
@@ -334,6 +350,8 @@ class MetricsLogger:
                 "cached_token_rate": 0.0, "shared_cached_token_rate": 0.0,
                 "hit_basis": "none", "cache_ground_truth_coverage": 0.0,
                 "p50_latency_ms": 0.0, "p99_latency_ms": 0.0,
+                "p50_e2e_latency_ms": 0.0, "p99_e2e_latency_ms": 0.0,
+                "p50_queue_wait_ms": 0.0, "p99_queue_wait_ms": 0.0,
                 "goodput": 0.0, "proxy_hit_rate": 0.0,
                 "n_records_all": n_all, "n_warmup_windows_discarded": warm_w,
             }
@@ -342,7 +360,10 @@ class MetricsLogger:
             total_misses = n - total_hits
             shared_hits = sum(1 for r in steady if r.hit and r.shared)
             lats = [r.latency_ms for r in steady]
-            good = sum(1 for r in steady if r.latency_ms <= self.cfg.sla_latency_ms)
+            e2e = [(r.e2e_latency_ms or r.latency_ms) for r in steady]
+            qw = [r.queue_wait_ms for r in steady]
+            good = sum(1 for r in steady
+                       if (r.e2e_latency_ms or r.latency_ms) <= self.cfg.sla_latency_ms)
             # Token-level ground truth -- the headline number.
             gt = [r for r in steady if r.num_cached_tokens >= 0]
             prompt_tok = sum(max(0, r.n_prompt_tokens) for r in gt)
@@ -367,6 +388,12 @@ class MetricsLogger:
                 "cache_ground_truth_coverage": len(gt) / n if n else 0.0,
                 "p50_latency_ms": percentile(lats, 0.50),
                 "p99_latency_ms": percentile(lats, 0.99),
+                # End-to-end, including dispatch-queue wait. This is the
+                # user-visible number and the one goodput is judged on.
+                "p50_e2e_latency_ms": percentile(e2e, 0.50),
+                "p99_e2e_latency_ms": percentile(e2e, 0.99),
+                "p50_queue_wait_ms": percentile(qw, 0.50),
+                "p99_queue_wait_ms": percentile(qw, 0.99),
                 "goodput": good / n,
                 # What the discredited latency threshold would have reported,
                 # on the same requests. Published side by side on purpose.

@@ -137,11 +137,30 @@ def _record_request(
     overlap: OverlapIndex,
     in_flight_at_submit: int,
     sim_complete_t: float,
+    arrival_wall_t: Optional[float] = None,
 ) -> None:
-    # Use wall-clock times for latency; res.submit_t is the simulation time
-    # supplied by the driver, not a wall clock.
+    # Two different latencies, and the distinction matters.
+    #
+    # `latency_ms` (engine latency) runs from the moment we handed the
+    # request to vLLM to completion. It does NOT include time the request
+    # spent waiting in OUR dispatch queue.
+    #
+    # `e2e_latency_ms` runs from the moment the user's turn became
+    # available (`qr.event.t`, mapped to wall clock) to completion. That is
+    # what a user actually experiences.
+    #
+    # Reporting only engine latency systematically flatters any policy that
+    # reorders aggressively: a request the policy deprioritises waits in the
+    # dispatch queue, and that wait is invisible. Starvation would show up
+    # as *better* latency. Goodput is therefore computed on e2e.
     wall_latency_ms = (res.complete_t - res.submit_wall_t) * 1000.0
     latency_ms = wall_latency_ms
+    if arrival_wall_t is not None:
+        e2e_latency_ms = (res.complete_t - arrival_wall_t) * 1000.0
+        queue_wait_ms = max(0.0, (res.submit_wall_t - arrival_wall_t) * 1000.0)
+    else:
+        e2e_latency_ms = latency_ms
+        queue_wait_ms = 0.0
     hit, hit_basis = _classify_hit(res, cfg)
     proxy_hit = _classify_hit_latency_proxy(
         latency_ms, cfg.hit_latency_threshold_ms
@@ -176,6 +195,8 @@ def _record_request(
             hit_basis=hit_basis,
             proxy_hit=proxy_hit,
             context_truncated=getattr(qr.event, "context_truncated", False),
+            e2e_latency_ms=e2e_latency_ms,
+            queue_wait_ms=queue_wait_ms,
         )
     )
     overlap.touch_session(qr.event.session_id, qr.event.prompt_tokens)
@@ -326,7 +347,8 @@ async def run_benchmark(
                             error=repr(e),
                         )
                     _record_request(
-                        qr, res, cfg, metrics, overlap, len(in_flight) + 1, sim_now
+                        qr, res, cfg, metrics, overlap, len(in_flight) + 1, sim_now,
+                        arrival_wall_t=sim_start_wall + qr.event.t / speed,
                     )
                     n_completed += 1
                     if n_completed == 1 or n_completed % 50 == 0:
@@ -367,7 +389,9 @@ async def run_benchmark(
                                         error=repr(e),
                                     )
                                 _record_request(
-                                    qr, res, cfg, metrics, overlap, len(in_flight) + 1, sim_now
+                                    qr, res, cfg, metrics, overlap,
+                                    len(in_flight) + 1, sim_now,
+                                    arrival_wall_t=sim_start_wall + qr.event.t / speed,
                                 )
                                 n_completed += 1
                                 if n_completed == 1 or n_completed % 50 == 0:
