@@ -78,6 +78,8 @@ def token_id_to_text(tok: int, vocab_size: int) -> str:
 def tokens_to_text(tokens, vocab_size: int) -> str:
     return " ".join(token_id_to_text(int(t), vocab_size) for t in tokens)
 
+import gc
+import inspect
 import logging
 import os
 import time
@@ -208,7 +210,6 @@ class VLLMBackend:
               f"max_len={self.cfg.max_model_len} max_seqs={self.cfg.max_num_seqs} "
               f"prefix_caching={self.cfg.enable_prefix_caching} "
               f"enforce_eager={self.cfg.enforce_eager}")
-        import inspect
         try:
             from vllm import AsyncLLMEngine, AsyncEngineArgs
         except Exception as e:  # noqa: BLE001
@@ -277,8 +278,29 @@ class VLLMBackend:
                 fut.cancel()
         self._pending.clear()
         self._tasks.clear()
-        self.engine = None
+        # Shut the engine down explicitly. Dropping the reference is not
+        # enough on V1: the engine core is a separate process that keeps
+        # its GPU memory until it is told to exit, so the next engine in
+        # the matrix can start against a GPU that is still partly taken.
+        eng, self.engine = self.engine, None
         self._started = False
+        if eng is not None:
+            shutdown = getattr(eng, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    r = shutdown()
+                    if inspect.isawaitable(r):
+                        await r
+                except Exception as e:  # noqa: BLE001
+                    print(f"[vllm] WARNING: engine shutdown raised {e!r}")
+            del eng
+        gc.collect()
+        try:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
 
 
     async def submit(
@@ -357,6 +379,11 @@ class VLLMBackend:
                 )
                 if not fut.done():
                     fut.set_result(result)
+            except asyncio.CancelledError:
+                # Leave no future unresolved: the driver waits on these.
+                if not fut.done():
+                    fut.cancel()
+                raise
             except Exception as e:  # noqa: BLE001
                 if not fut.done():
                     fut.set_exception(e)
@@ -380,23 +407,86 @@ class VLLMBackend:
             # A later request found it after an earlier one did not.
             self.cached_tokens_source = src
 
+    # Prometheus counter names V1 exports for block-level prefix caching.
+    _PREFIX_QUERY_METRICS = (
+        "vllm:gpu_prefix_cache_queries",
+        "vllm:gpu_prefix_cache_queries_total",
+    )
+    _PREFIX_HIT_METRICS = (
+        "vllm:gpu_prefix_cache_hits",
+        "vllm:gpu_prefix_cache_hits_total",
+    )
+
+    def _prefix_cache_counters(self) -> Optional[tuple]:
+        """Cumulative (queries, hits) in KV blocks, from the metrics registry.
+
+        On the V1 engine the scheduler and its block pool live in a SEPARATE
+        PROCESS, so walking `engine.engine.scheduler...` from here finds
+        nothing -- which is why this cross-check silently returned -1 for
+        every run in the previous round. The counters do reach this process
+        through the Prometheus client registry, so read them there.
+        """
+        try:
+            from prometheus_client import REGISTRY  # type: ignore
+        except Exception:  # noqa: BLE001
+            return None
+        queries = hits = None
+        for metric in REGISTRY.collect():
+            if metric.name in self._PREFIX_QUERY_METRICS:
+                queries = sum(s.value for s in metric.samples
+                              if s.name.endswith(("_total", "_count"))
+                              or s.name == metric.name)
+            elif metric.name in self._PREFIX_HIT_METRICS:
+                hits = sum(s.value for s in metric.samples
+                           if s.name.endswith(("_total", "_count"))
+                           or s.name == metric.name)
+        if queries is None or hits is None:
+            return None
+        return float(queries), float(hits)
+
+    def snapshot_prefix_cache_baseline(self) -> None:
+        """Record the counters so later reads exclude warmup requests.
+
+        Call once after the untimed warmup probes and before the workload.
+        The counters are cumulative for the engine process; without a
+        baseline the warmup prefills would be folded into the run's rate.
+        """
+        self._prefix_baseline = self._prefix_cache_counters()
+
     def prefix_cache_hit_rate(self) -> Optional[float]:
         """Engine-level prefix-cache hit rate, as a cross-check.
 
-        vLLM tracks a cumulative `gpu_prefix_cache_hit_rate` (queries vs.
-        hits, in blocks) inside the engine. We read it opportunistically
-        so the writeup can show that the per-request token counters we sum
-        agree with the engine's own accounting. Returns None when the
-        attribute chain is not present on this build.
+        This is block-level and independent of the per-request
+        `num_cached_tokens` we sum ourselves, so agreement between the two
+        is real evidence the headline number is read correctly. Returns
+        None when neither source is available on this build.
+
+        Prefers the metrics registry (works on V1, where the block pool is
+        out of process); falls back to walking the engine for V0 builds.
         """
         eng = self.engine
         if eng is None:
             return None
+
+        counters = self._prefix_cache_counters()
+        if counters is not None:
+            queries, hits = counters
+            base = getattr(self, "_prefix_baseline", None)
+            if base is not None:
+                queries -= base[0]
+                hits -= base[1]
+            if queries > 0:
+                return hits / queries
+
         for path in (
             ("engine", "scheduler", 0, "kv_cache_manager",
              "block_pool", "get_prefix_cache_hit_rate"),
             ("engine", "scheduler", "kv_cache_manager", "block_pool",
              "get_prefix_cache_hit_rate"),
+            ("engine_core", "scheduler", "kv_cache_manager",
+             "block_pool", "get_prefix_cache_hit_rate"),
+            ("llm_engine", "scheduler", 0, "kv_cache_manager",
+             "block_pool", "get_prefix_cache_hit_rate"),
         ):
             node: Any = eng
             try:

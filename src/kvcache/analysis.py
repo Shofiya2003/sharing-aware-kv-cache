@@ -22,6 +22,7 @@ Outputs:
 from __future__ import annotations
 
 import os
+import statistics
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -197,17 +198,21 @@ def plot_p99_latency(rs: RunSet, out_path: str, capacity: str = "constrained") -
     plt.figure(figsize=(10, 5))
     for policy in POLICY_ORDER:
         for variant, _label, df in _matching(rs, policy, capacity):
+            # End-to-end, not engine latency: engine latency hides the time
+            # a reordering policy leaves requests waiting in the dispatcher.
+            col = ("p99_e2e_latency_ms" if "p99_e2e_latency_ms" in df.columns
+                   else "p99_latency_ms")
             plt.plot(
                 df["t_start"],
-                df["p99_latency_ms"],
+                df[col],
                 label=_legend_name(policy, variant),
                 color=POLICY_COLORS.get(policy, None),
                 linewidth=2.0,
                 linestyle="--" if variant else "-",
             )
     plt.xlabel("Simulated time (s)")
-    plt.ylabel("P99 latency (ms)")
-    plt.title(f"P99 latency over time — {capacity} capacity")
+    plt.ylabel("P99 end-to-end latency (ms)")
+    plt.title(f"P99 end-to-end latency over time — {capacity} capacity")
     plt.legend(loc="best")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -353,6 +358,191 @@ def plot_ablation_bar(rs: RunSet, out_path: str) -> None:
     plt.close()
 
 
+def _seed_of(label: str) -> Optional[int]:
+    """Seed index for a base/`_s<N>` label; None for other variants.
+
+    The matrix writes seed 0 with no suffix and seeds 1..N as `_s<N>`.
+    Alpha sweeps and alignment arms carry other suffixes and are not
+    seeds, so they must not be pooled as replicates.
+    """
+    p, c, v = _split_policy_and_capacity(label)
+    if p not in POLICY_ORDER or c not in ("constrained", "generous"):
+        return None
+    if not v:
+        return 0
+    tail = v.lstrip("_")
+    if tail.startswith("s") and tail[1:].isdigit():
+        return int(tail[1:])
+    return None
+
+
+def _usable(s: dict) -> bool:
+    """Is this run admissible as a data point?
+
+    Written defensively: `usable` is a newer column, so fall back to the
+    underlying conditions when reading CSVs from an older run.
+    """
+    if "usable" in s and str(s.get("usable")) not in ("", "nan"):
+        try:
+            return int(float(s["usable"])) == 1
+        except (TypeError, ValueError):
+            pass
+    basis_ok = str(s.get("hit_basis", "")) == "cached_tokens"
+    try:
+        cov_ok = float(s.get("cache_ground_truth_coverage", 0.0)) >= 0.99
+    except (TypeError, ValueError):
+        cov_ok = False
+    try:
+        err_ok = float(s.get("error_rate", 0.0) or 0.0) <= 0.01
+    except (TypeError, ValueError):
+        err_ok = True
+    return basis_ok and cov_ok and err_ok and not _legacy_saturated(s)
+
+
+# Pre-`saturated`-column CSVs (round 2) are judged on median dispatch wait
+# instead. 10 s is 4x the 2.5 s SLA, the same bar metrics.py applies.
+_LEGACY_SATURATED_QUEUE_WAIT_MS = 10_000.0
+
+
+def _legacy_saturated(s: dict) -> bool:
+    if str(s.get("saturated", "")) not in ("", "nan"):
+        return False  # new CSV: `usable` already accounts for it
+    try:
+        return float(s.get("p50_queue_wait_ms", 0.0)) > _LEGACY_SATURATED_QUEUE_WAIT_MS
+    except (TypeError, ValueError):
+        return False
+
+
+def _quarantine_section(rs: RunSet) -> List[str]:
+    """List runs excluded from the pooled statistics, and why.
+
+    Round 2 shipped `fifo_generous_s2` in the headline table with 18%
+    ground-truth coverage and a p50 end-to-end latency of 1.5 ms against
+    60-360 s everywhere else. It did not serve the workload, and because
+    it was pooled in it made FIFO look like the best policy at generous
+    capacity. Excluded runs are reported here rather than dropped
+    silently.
+    """
+    bad = []
+    for label in sorted(rs.summaries):
+        if _seed_of(label) is None:
+            continue
+        s = rs.summaries[label].iloc[0].to_dict()
+        if _usable(s):
+            continue
+        reasons = []
+        if str(s.get("hit_basis", "")) != "cached_tokens":
+            reasons.append(f"basis={s.get('hit_basis')}")
+        try:
+            cov = float(s.get("cache_ground_truth_coverage", 0.0))
+            if cov < 0.99:
+                reasons.append(f"coverage={cov:.2f}")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if float(s.get("error_rate", 0.0) or 0.0) > 0.01:
+                reasons.append(
+                    f"engine failed {int(float(s.get('n_failed', 0)))} requests "
+                    f"({float(s['error_rate']):.0%})"
+                )
+        except (TypeError, ValueError):
+            pass
+        if _legacy_saturated(s):
+            reasons.append(
+                f"saturated (p50 dispatch wait "
+                f"{float(s['p50_queue_wait_ms'])/1000:.0f}s; pre-watchdog run)"
+            )
+        try:
+            if int(float(s.get("saturated", 0))) == 1:
+                reasons.append(
+                    f"saturated (queue wait "
+                    f"{float(s.get('queue_wait_first_window_ms', 0))/1000:.0f}s"
+                    f"->{float(s.get('queue_wait_last_window_ms', 0))/1000:.0f}s)"
+                )
+        except (TypeError, ValueError):
+            pass
+        bad.append((label, ", ".join(reasons) or "unknown"))
+    if not bad:
+        return []
+    out = ["", "## Quarantined runs — EXCLUDED from the pooled numbers below", ""]
+    out.append(
+        "These runs did not measure what the matrix intends to measure. "
+        "They are listed so the exclusion is visible, not to be reported "
+        "as results."
+    )
+    out.append("")
+    out.append("| Run | Why excluded |")
+    out.append("|---|---|")
+    for label, why in bad:
+        out.append(f"| `{label}` | {why} |")
+    return out
+
+
+def _paired_section(rs: RunSet) -> List[str]:
+    """Per-seed paired deltas against FIFO — the comparison that resolves.
+
+    Pooling each cell as mean +/- sd across seeds cannot separate the
+    policy effect from seed noise here: the seed-to-seed spread of
+    `cached_token_rate` is ~0.066 while the policy effect is ~0.02.
+    But seed variation is a property of the WORKLOAD, and every policy
+    runs the same workload for a given seed, so it cancels when each
+    policy is differenced against FIFO within a seed. The paired spread
+    is roughly 8x smaller, which is what makes the effect readable.
+    """
+    out: List[str] = ["", "## Paired comparison vs FIFO (same seed)", ""]
+    out.append(
+        "Each cell is `cached_token_rate(policy, seed) - "
+        "cached_token_rate(fifo, seed)`. Seed noise is shared by both "
+        "terms and cancels; the unpaired per-seed spread (~0.066) is an "
+        "artifact of differing workloads, not of the policies. A mean "
+        "several times its own sd, with a consistent sign across seeds, "
+        "is a real effect. Quarantined runs and seeds missing a FIFO "
+        "partner are skipped."
+    )
+    out.append("")
+    for cap in ("constrained", "generous"):
+        rows = []
+        for policy in POLICY_ORDER:
+            if policy == "fifo":
+                continue
+            deltas = []
+            for label in sorted(rs.summaries):
+                seed = _seed_of(label)
+                p, c, _v = _split_policy_and_capacity(label)
+                if seed is None or p != policy or c != cap:
+                    continue
+                base_label = f"fifo_{cap}" + ("" if seed == 0 else f"_s{seed}")
+                if base_label not in rs.summaries:
+                    continue
+                a = rs.summaries[label].iloc[0].to_dict()
+                b = rs.summaries[base_label].iloc[0].to_dict()
+                if not (_usable(a) and _usable(b)):
+                    continue
+                deltas.append((seed, float(a["cached_token_rate"])
+                               - float(b["cached_token_rate"])))
+            if deltas:
+                rows.append((policy, sorted(deltas)))
+        if not rows:
+            continue
+        out.append(f"### {cap}")
+        out.append("")
+        out.append("| Policy | per-seed Δ | n | mean Δ | sd | same sign? |")
+        out.append("|---|---|---:|---:|---:|---|")
+        for policy, deltas in rows:
+            vals = [d for _s, d in deltas]
+            mean = sum(vals) / len(vals)
+            sd = statistics.stdev(vals) if len(vals) > 1 else float("nan")
+            same = "yes" if all(v > 0 for v in vals) or all(v < 0 for v in vals) else "NO"
+            per = " ".join(f"{v:+.4f}" for v in vals)
+            sd_s = "—" if len(vals) < 2 else f"{sd:.4f}"
+            out.append(
+                f"| {_legend_name(policy, '')} | `{per}` | {len(vals)} | "
+                f"{mean:+.4f} | {sd_s} | {same} |"
+            )
+        out.append("")
+    return out
+
+
 def write_interpretation(rs: RunSet, out_path: str) -> None:
     """Auto-generate a short interpretation note from the run summaries.
 
@@ -373,14 +563,19 @@ def write_interpretation(rs: RunSet, out_path: str) -> None:
         "discredited latency threshold would have reported on the same "
         "requests; it is shown only so the gap is visible. `trunc` is the "
         "share of requests whose prefix was invalidated by hitting the "
-        "context window (a miss cause unrelated to the policy). Summaries "
+        "context window (a miss cause unrelated to the policy). Latencies "
+        "are END-TO-END (from the user's turn, including dispatch-queue "
+        "wait); engine-only latency flatters policies that reorder, so it "
+        "is not shown. `goodput` is the share of requests within the SLA. "
+        "Rows marked ✗ are not usable (see Quarantined runs). Summaries "
         "exclude warmup windows.\n"
     )
     lines.append(
         "| Policy | Capacity | Reqs | cached_tok | shared_cached_tok | "
-        "req_hit | P50 (ms) | P99 (ms) | trunc | proxy | basis |"
+        "req_hit | P50 e2e (ms) | P99 e2e (ms) | goodput | trunc | proxy | "
+        "basis | usable |"
     )
-    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
 
     def row(policy: str, cap: str, s: dict) -> str:
         basis = str(s.get("hit_basis", "?"))
@@ -391,11 +586,12 @@ def write_interpretation(rs: RunSet, out_path: str) -> None:
             f"{s.get('cached_token_rate', float('nan')):.3f} | "
             f"{s.get('shared_cached_token_rate', float('nan')):.3f} | "
             f"{s.get('hit_rate', 0):.3f} | "
-            f"{s.get('p50_latency_ms', 0):.0f} | "
-            f"{s.get('p99_latency_ms', 0):.0f} | "
+            f"{s.get('p50_e2e_latency_ms', s.get('p50_latency_ms', 0)):.0f} | "
+            f"{s.get('p99_e2e_latency_ms', s.get('p99_latency_ms', 0)):.0f} | "
+            f"{s.get('goodput', float('nan')):.2f} | "
             f"{s.get('context_truncated_rate', float('nan')):.2f} | "
             f"{s.get('proxy_hit_rate', float('nan')):.3f} | "
-            f"{basis}{flag} |"
+            f"{basis}{flag} | {'✓' if _usable(s) else '✗'} |"
         )
 
     for policy in POLICY_ORDER:
@@ -419,6 +615,8 @@ def write_interpretation(rs: RunSet, out_path: str) -> None:
             s = rs.summaries[label].iloc[0].to_dict()
             s["_variant"] = v
             lines.append(row(p, c, s))
+    lines.extend(_quarantine_section(rs))
+    lines.extend(_paired_section(rs))
     lines.append("")
     lines.append("## Validity checks — do these FIRST")
     lines.append("")

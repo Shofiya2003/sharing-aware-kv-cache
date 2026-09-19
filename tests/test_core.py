@@ -569,6 +569,73 @@ class TestAnalysisLabels(unittest.TestCase):
             )
 
 
+class _FailingBackend(MockVLLMBackend):
+    """Mock whose engine "dies" after `ok` requests, or fails listed ones."""
+
+    def __init__(self, cfg, ok=10**9, fail_at=()):
+        super().__init__(cfg)
+        self._ok = ok
+        self._fail_at = set(fail_at)
+        self._n = 0
+
+    async def submit(self, prompt, session_id, turn_index, submit_t,
+                     max_new_tokens=32, sampling_params=None):
+        self._n += 1
+        if self._n > self._ok or self._n in self._fail_at:
+            rid = f"{session_id}__t{turn_index}__dead{self._n}"
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_exception(RuntimeError("EngineDeadError (simulated)"))
+            self._pending[rid] = fut
+            return rid
+        return await super().submit(prompt, session_id, turn_index, submit_t,
+                                    max_new_tokens, sampling_params)
+
+
+class TestEngineFailure(unittest.TestCase):
+    """Round 2's fifo_generous_s2: a dead engine must not produce a 'run'."""
+
+    def _run(self, backend, tmp):
+        w = generate_workload(
+            WorkloadConfig(num_sessions=4, sim_window_s=60, seed=2,
+                           mean_idle_gap_s=2))
+        cfg = BenchConfig(
+            policy_name="fifo", backend=BackendConfig(max_num_seqs=2),
+            max_new_tokens=4, output_dir=tmp, run_label="dead",
+            speed_factor=300.0, discard_warmup_windows=0,
+        )
+
+        async def go():
+            await backend.start()
+            try:
+                return await run_benchmark(w, cfg, backend=backend)
+            finally:
+                await backend.stop()
+        return asyncio.run(go())
+
+    def test_dead_engine_aborts_and_is_set_aside(self):
+        from kvcache.bench import EngineFailure
+        with tempfile.TemporaryDirectory() as tmp:
+            b = _FailingBackend(BackendConfig(max_num_seqs=2), ok=8)
+            with self.assertRaises(EngineFailure):
+                self._run(b, tmp)
+            # Not left where the launcher would count it as done ...
+            self.assertFalse(os.path.exists(os.path.join(tmp, "summary_dead.csv")))
+            # ... but kept for inspection.
+            self.assertTrue(os.path.exists(
+                os.path.join(tmp, "_aborted", "summary_dead.csv")))
+
+    def test_failed_request_is_not_scored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = _FailingBackend(BackendConfig(max_num_seqs=2), fail_at={3})
+            r = self._run(b, tmp)
+            s = r.summary
+            self.assertEqual(s["n_failed"], 1)
+            # The failed request has no cache counter; had it been scored,
+            # coverage would drop below 1 and basis would read "mixed".
+            self.assertEqual(s["hit_basis"], "cached_tokens")
+            self.assertEqual(s["cache_ground_truth_coverage"], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

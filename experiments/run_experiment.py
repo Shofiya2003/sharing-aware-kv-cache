@@ -23,7 +23,13 @@ import os
 import sys
 import time
 
-from kvcache.bench import BenchConfig, MockVLLMBackend, run_benchmark
+from kvcache.bench import (
+    BenchConfig,
+    EngineFailure,
+    MockVLLMBackend,
+    OverloadedRun,
+    run_benchmark,
+)
 from kvcache.analysis import run_analysis, ensure_base_results
 from kvcache.vllm_backend import BackendConfig, VLLMBackend
 from kvcache.workload import WorkloadConfig, generate_workload
@@ -63,6 +69,7 @@ async def run_single(
         hit_latency_threshold_ms=args.hit_latency_threshold_ms,
         hit_cached_fraction=args.hit_cached_fraction,
         discard_warmup_windows=args.discard_warmup_windows,
+        abort_on_backlog_s=args.abort_on_backlog_s,
         output_dir=args.csv_dir,
         run_label=label,
     )
@@ -85,6 +92,10 @@ async def run_single(
             max_new_tokens=4,
         )
         await backend.wait(rid)
+    # Baseline the engine's cumulative block counters here, so the
+    # cross-check rate covers the workload only and not these probes.
+    if hasattr(backend, "snapshot_prefix_cache_baseline"):
+        backend.snapshot_prefix_cache_baseline()
     print(f"[run] {label}: warmup done", flush=True)
     t0 = time.monotonic()
     try:
@@ -94,9 +105,12 @@ async def run_single(
     elapsed = time.monotonic() - t0
     print(
         f"[run] <<< {label} done in {elapsed:.1f}s | "
-        f"hit_rate={r.summary['hit_rate']:.3f} "
-        f"p99={r.summary['p99_latency_ms']:.0f}ms "
-        f"goodput={r.summary['goodput']:.2f}"
+        f"cached_token_rate={r.summary['cached_token_rate']:.3f} "
+        f"p50_e2e={r.summary['p50_e2e_latency_ms']:.0f}ms "
+        f"p99_e2e={r.summary['p99_e2e_latency_ms']:.0f}ms "
+        f"goodput={r.summary['goodput']:.2f} "
+        f"failed={r.summary.get('n_failed', 0)} "
+        f"usable={r.summary.get('usable', '?')}"
     )
     return r.summary
 
@@ -132,6 +146,20 @@ async def amain(args) -> int:
         f"[run] workload: {len(workload.sessions)} sessions, "
         f"{len(workload.events)} events"
     )
+    if args.target_arrival_rate > 0:
+        # A speed factor is only meaningful for the workload it was computed
+        # on: the same factor over a denser workload is a higher arrival
+        # rate. Arm 2 (20 sessions, 300 s) at arm 1's factor (12 sessions,
+        # 600 s) would have been offered ~2x the load. Derive it here from
+        # the measured request rate instead.
+        if not workload.events:
+            print("[run] workload has no events; cannot derive a speed factor")
+            return 1
+        args.speed_factor = (args.target_arrival_rate * args.sim_window
+                             / len(workload.events))
+        print(f"[run] --target-arrival-rate {args.target_arrival_rate:.3f} req/s "
+              f"-> --speed-factor {args.speed_factor:.3f} "
+              f"(~{args.sim_window / args.speed_factor / 60:.1f} min wall per run)")
 
     pairs = []
     if args.policy and args.capacity:
@@ -150,7 +178,19 @@ async def amain(args) -> int:
                 pairs.append((policy, cap, gpu_mem))
 
     for policy, cap, gpu_mem in pairs:
-        await run_single(policy, cap, workload, gpu_mem, args)
+        try:
+            await run_single(policy, cap, workload, gpu_mem, args)
+        except OverloadedRun as e:
+            # Configuration error, not a bug. Exit non-zero so an unattended
+            # matrix stops here instead of producing 23 more runs of the
+            # same unusable data.
+            print(f"\n{e}\n", flush=True)
+            return 2
+        except EngineFailure as e:
+            # The engine died mid-run. Usually transient (GPU memory not
+            # yet released by a previous engine); the launcher retries.
+            print(f"\n{e}\n", flush=True)
+            return 3
 
     run_analysis(args.csv_dir, args.fig_dir)
     return 0
@@ -171,6 +211,11 @@ def main() -> int:
     p.add_argument("--generous-gpu-mem", type=float, default=0.7)
     p.add_argument("--constrained-gpu-mem", type=float, default=0.3)
     p.add_argument("--speed-factor", type=float, default=10.0)
+    p.add_argument("--target-arrival-rate", type=float, default=0.0,
+                   help="Offered load in requests per wall second. When set, "
+                        "overrides --speed-factor with the value that gives "
+                        "THIS workload that rate. Use the rate from "
+                        "experiments/calibrate_load.py.")
     p.add_argument("--sla-latency-ms", type=float, default=2500.0)
     p.add_argument("--hit-latency-threshold-ms", type=float, default=300.0,
                    help="LEGACY latency proxy. Only emits the proxy_hit_rate "
@@ -178,6 +223,12 @@ def main() -> int:
     p.add_argument("--hit-cached-fraction", type=float, default=0.10,
                    help="A request is a hit when at least this fraction of its "
                         "prompt tokens were served from cache (ground truth).")
+    p.add_argument("--abort-on-backlog-s", type=float, default=90.0,
+                   help="Abort the run if the oldest request has waited this "
+                        "long in the DISPATCH queue. Guards against the "
+                        "failure mode where offered load exceeds engine "
+                        "capacity and the run measures queue depth rather "
+                        "than cache reuse. 0 disables.")
     p.add_argument("--discard-warmup-windows", type=int, default=1,
                    help="Leading time windows excluded from the run summary as "
                         "engine warmup. Keeps run order out of the headline P99.")

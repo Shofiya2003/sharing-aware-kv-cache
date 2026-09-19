@@ -55,6 +55,11 @@ class RequestRecord:
     # Goodput is computed on this one.
     e2e_latency_ms: float = 0.0
     queue_wait_ms: float = 0.0
+    # The engine raised instead of serving this request. Such a record has
+    # no prompt tokens, no cache counter and a ~0 ms latency, so it must
+    # never reach the hit/latency statistics: round 2's `fifo_generous_s2`
+    # was 82% failed requests that were scored as instant proxy "hits".
+    error: bool = False
 
     @property
     def cached_fraction(self) -> float:
@@ -113,6 +118,9 @@ class MetricsLogger:
     def __init__(self, cfg: MetricsConfig) -> None:
         self.cfg = cfg
         self.records: List[RequestRecord] = []
+        # Requests the engine failed. Kept apart from `records` so every
+        # downstream statistic sees served requests only.
+        self.failed: List[RequestRecord] = []
         os.makedirs(cfg.output_dir, exist_ok=True)
         # Per-window in-memory accumulators
         self._win_states: Dict[int, Dict] = {}
@@ -126,6 +134,9 @@ class MetricsLogger:
         self._finalized = False
 
     def record(self, r: RequestRecord) -> None:
+        if r.error:
+            self.failed.append(r)
+            return
         self.records.append(r)
         # Classify into a window based on submit time
         w = int(r.submit_t // self.cfg.window_s)
@@ -163,6 +174,33 @@ class MetricsLogger:
         st["in_flight_sum"] += r.in_flight_at_submit
         if r.in_flight_at_submit > st["in_flight_max"]:
             st["in_flight_max"] = r.in_flight_at_submit
+
+    def _saturation_diagnostics(self, warm_w: int) -> Dict:
+        """Did the dispatch backlog grow without bound during this run?
+
+        Offered load above engine capacity makes p50 queue wait climb
+        monotonically window over window. That run is measuring queue
+        depth, not cache behaviour: requests are dispatched so long after
+        their turn that the session's prefix has already been evicted, so
+        the hit rate decays with the backlog. We compare the first and
+        last non-warmup windows that actually carry requests.
+
+        `saturated` requires BOTH a large growth ratio and an absolute
+        wait that is itself meaningful, so a run that merely rises from
+        20 ms to 80 ms is not flagged.
+        """
+        wins = sorted(w for w in self._win_states if w >= warm_w
+                      and self._win_states[w]["lookups"] > 0)
+        if len(wins) < 2:
+            return {"first_ms": 0.0, "last_ms": 0.0, "growth": 0.0,
+                    "saturated": False}
+        first = percentile(self._win_states[wins[0]]["queue_waits"], 0.50)
+        last = percentile(self._win_states[wins[-1]]["queue_waits"], 0.50)
+        growth = (last / first) if first > 0 else float("inf") if last > 0 else 0.0
+        saturated = bool(last > self.cfg.sla_latency_ms * 4 and growth > 2.0)
+        return {"first_ms": first, "last_ms": last,
+                "growth": (0.0 if growth == float("inf") else growth),
+                "saturated": saturated}
 
     def _new_win_state(self) -> Dict:
         return {
@@ -341,6 +379,11 @@ class MetricsLogger:
         ]
         n_all = len(self.records)
         n = len(steady)
+        n_failed = sum(
+            1 for r in self.failed
+            if int(r.submit_t // self.cfg.window_s) >= warm_w
+        )
+        error_rate = n_failed / (n + n_failed) if (n + n_failed) else 0.0
         if n == 0:
             summary = {
                 "policy": self.cfg.run_label,
@@ -354,6 +397,12 @@ class MetricsLogger:
                 "p50_queue_wait_ms": 0.0, "p99_queue_wait_ms": 0.0,
                 "goodput": 0.0, "proxy_hit_rate": 0.0,
                 "n_records_all": n_all, "n_warmup_windows_discarded": warm_w,
+                "context_truncated_rate": 0.0,
+                "queue_wait_first_window_ms": 0.0,
+                "queue_wait_last_window_ms": 0.0,
+                "queue_wait_growth_ratio": 0.0,
+                "saturated": 0, "usable": 0,
+                "n_failed": n_failed, "error_rate": error_rate,
             }
         else:
             total_hits = sum(1 for r in steady if r.hit)
@@ -372,6 +421,8 @@ class MetricsLogger:
             sh_cached_tok = sum(r.num_cached_tokens for r in gt if r.shared)
             bases = {r.hit_basis for r in steady}
             basis = bases.pop() if len(bases) == 1 else "mixed:" + "+".join(sorted(bases))
+            sat = self._saturation_diagnostics(warm_w)
+            coverage = len(gt) / n if n else 0.0
             summary = {
                 "policy": self.cfg.run_label,
                 "lookups": n,
@@ -385,7 +436,7 @@ class MetricsLogger:
                 "cached_token_rate": (cached_tok / prompt_tok) if prompt_tok else 0.0,
                 "shared_cached_token_rate": (sh_cached_tok / sh_prompt_tok) if sh_prompt_tok else 0.0,
                 "hit_basis": basis,
-                "cache_ground_truth_coverage": len(gt) / n if n else 0.0,
+                "cache_ground_truth_coverage": coverage,
                 "p50_latency_ms": percentile(lats, 0.50),
                 "p99_latency_ms": percentile(lats, 0.99),
                 # End-to-end, including dispatch-queue wait. This is the
@@ -406,6 +457,32 @@ class MetricsLogger:
                 "context_truncated_rate": sum(
                     1 for r in steady if r.context_truncated
                 ) / n,
+                # --- Saturation: is this run measuring cache or backlog? ---
+                # When offered load exceeds engine capacity the dispatch
+                # backlog grows without bound, requests are served long
+                # after their turn (so their prefix is gone), and the run's
+                # hit rate decays with queue depth rather than reflecting
+                # the policy. These make that visible per run instead of
+                # requiring someone to eyeball the time series.
+                "queue_wait_first_window_ms": sat["first_ms"],
+                "queue_wait_last_window_ms": sat["last_ms"],
+                "queue_wait_growth_ratio": sat["growth"],
+                "saturated": int(sat["saturated"]),
+                # Requests the engine failed rather than served. Excluded
+                # from every number above; a run with more than a stray one
+                # did not serve the workload and is not a data point.
+                "n_failed": n_failed,
+                "error_rate": error_rate,
+                # One flag the analysis layer can filter on: a run is usable
+                # as a data point only if hit/miss came from the engine for
+                # essentially every request, the engine actually served the
+                # workload, AND the run reached steady state.
+                "usable": int(
+                    basis == "cached_tokens"
+                    and coverage >= 0.99
+                    and error_rate <= 0.01
+                    and not sat["saturated"]
+                ),
             }
         summary_path = os.path.join(self.cfg.output_dir, f"summary_{self.cfg.run_label}.csv")
         pd.DataFrame([summary]).to_csv(summary_path, index=False)

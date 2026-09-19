@@ -66,6 +66,32 @@ from .vllm_backend import BackendConfig, RequestResult, VLLMBackend, tokens_to_t
 from .workload import Workload
 
 
+class OverloadedRun(RuntimeError):
+    """Raised when the dispatch backlog proves offered load exceeds capacity.
+
+    Not a crash: it means the configuration, not the code, is wrong. The
+    run is abandoned deliberately because its numbers would describe the
+    queue rather than the cache.
+    """
+
+
+class EngineFailure(RuntimeError):
+    """Raised when the engine stops serving: every request comes back failed.
+
+    Round 2's `fifo_generous_s2` is what this guards against. The engine
+    died early, every later request failed instantly, and the run went on
+    to record ~450 "completions" at ~0 ms that the latency proxy scored as
+    hits. Retrying on a fresh engine is the right response, so the caller
+    gets a distinct exit code instead of a finished-looking CSV.
+    """
+
+
+# Consecutive failed requests after which the engine is presumed dead.
+# A healthy engine does not fail requests at all; five in a row is not
+# a transient.
+ENGINE_DEAD_AFTER = 5
+
+
 @dataclass
 class BenchConfig:
     """Knobs for one benchmark run."""
@@ -96,6 +122,17 @@ class BenchConfig:
     # which is what made run order (not policy) dominate the old P99
     # numbers: FIFO ran first in the matrix and absorbed it.
     discard_warmup_windows: int = 1
+
+    # Abort the run when the oldest request has been sitting in OUR dispatch
+    # queue longer than this (wall seconds). 0 disables the watchdog.
+    #
+    # Purpose: when offered load exceeds engine capacity the backlog grows
+    # without bound and the run stops measuring cache behaviour -- requests
+    # get dispatched so late that the session prefix is long evicted, so the
+    # hit rate tracks queue depth instead of the policy. Left unattended a
+    # 24-run matrix will happily spend six GPU-hours producing that. Failing
+    # the first run loudly is cheaper than discovering it in the CSVs.
+    abort_on_backlog_s: float = 0.0
 
 
 def make_policy(name: str, alpha: float = 0.5) -> DispatchPolicy:
@@ -197,9 +234,28 @@ def _record_request(
             context_truncated=getattr(qr.event, "context_truncated", False),
             e2e_latency_ms=e2e_latency_ms,
             queue_wait_ms=queue_wait_ms,
+            error=res.error is not None,
         )
     )
     overlap.touch_session(qr.event.session_id, qr.event.prompt_tokens)
+
+
+def _set_aside_aborted(cfg: BenchConfig, reason: str) -> None:
+    """Move an aborted run's CSVs out of the results directory.
+
+    An abandoned run still gets finalized (so its partial numbers can be
+    inspected), but it must not sit in `output_dir`: the launcher treats
+    any `summary_<label>.csv` there as finished and would never re-run it,
+    and the analysis would pool it.
+    """
+    dest = os.path.join(cfg.output_dir, "_aborted")
+    os.makedirs(dest, exist_ok=True)
+    for kind in ("summary", "time_series", "per_session"):
+        src = os.path.join(cfg.output_dir, f"{kind}_{cfg.run_label}.csv")
+        if os.path.exists(src):
+            os.replace(src, os.path.join(dest, os.path.basename(src)))
+    print(f"[bench:{cfg.run_label}] aborted ({reason}); CSVs moved to {dest}/ "
+          f"so the label is re-run, not counted as done.")
 
 
 @dataclass
@@ -255,7 +311,56 @@ async def run_benchmark(
     last_window_flushed = -1
     n_dispatched = 0
     n_completed = 0
+    n_failed = 0
+    consecutive_failures = 0
     n_events = 0
+    aborted: Optional[BaseException] = None
+    sim_now = 0.0
+
+    async def _reap(rid: str, qr: QueuedRequest) -> None:
+        """Collect one finished request and record it, failed or not."""
+        nonlocal n_completed, n_failed, consecutive_failures
+        try:
+            res = await backend.wait(rid)
+        except Exception as e:  # noqa: BLE001
+            now = time.monotonic()
+            res = RequestResult(
+                request_id=rid,
+                text="",
+                submit_t=qr.event.t,
+                submit_wall_t=now,
+                first_token_t=0.0,
+                complete_t=now,
+                n_output_tokens=0,
+                n_prompt_tokens=0,
+                error=repr(e),
+            )
+        _record_request(
+            qr, res, cfg, metrics, overlap, len(in_flight) + 1, sim_now,
+            arrival_wall_t=sim_start_wall + qr.event.t / speed,
+        )
+        n_completed += 1
+        if res.error is not None:
+            n_failed += 1
+            consecutive_failures += 1
+            if n_failed <= 3:
+                print(f"[bench:{cfg.run_label}] request {rid} FAILED: "
+                      f"{res.error[:300]}", flush=True)
+            if consecutive_failures >= ENGINE_DEAD_AFTER:
+                raise EngineFailure(
+                    f"[bench:{cfg.run_label}] ABORT: {consecutive_failures} "
+                    f"consecutive requests failed ({n_failed} total); the "
+                    f"engine is no longer serving. Last error: "
+                    f"{res.error[:300]}"
+                )
+        else:
+            consecutive_failures = 0
+        if n_completed == 1 or n_completed % 50 == 0:
+            print(f"[bench:{cfg.run_label}] progress: "
+                  f"completed={n_completed} failed={n_failed} "
+                  f"dispatched={n_dispatched} "
+                  f"enqueued={ei}/{n_events} in_flight={len(in_flight)} "
+                  f"queue={len(queue)} sim_t={sim_now:.1f}s")
     print(f"[bench:{cfg.run_label}] start: policy={cfg.policy_name} "
           f"capacity={cfg.capacity_setting} events={len(workload.events)} "
           f"sessions={len(workload.sessions)} sim_window={sim_window:.0f}s "
@@ -289,6 +394,25 @@ async def run_benchmark(
                 queue.append(QueuedRequest(event=ev, arrival_t=ev.t, enqueue_seq=seq))
                 seq += 1
                 ei += 1
+
+            # 2b. Backlog watchdog. `queue` is OUR dispatch queue, so the
+            # oldest entry's wall-clock wait is the clearest signal that
+            # offered load has outrun the engine. Checked before scoring so
+            # an unrecoverable run dies in minutes, not in twenty.
+            if cfg.abort_on_backlog_s > 0 and queue:
+                oldest_arrival_wall = sim_start_wall + min(
+                    q.arrival_t for q in queue) / speed
+                backlog_s = time.monotonic() - oldest_arrival_wall
+                if backlog_s > cfg.abort_on_backlog_s:
+                    raise OverloadedRun(
+                        f"[bench:{cfg.run_label}] ABORT: oldest queued request "
+                        f"has waited {backlog_s:.0f}s (limit "
+                        f"{cfg.abort_on_backlog_s:.0f}s). Offered load exceeds "
+                        f"engine capacity, so this run would measure queue "
+                        f"depth rather than cache reuse. Lower --speed-factor "
+                        f"or --num-sessions and re-run; "
+                        f"experiments/calibrate_load.py picks a safe value."
+                    )
 
             # 3. Re-score the queue with the active policy
             decision = policy.score_queue(queue, sessions, overlap, sim_now)
@@ -332,30 +456,7 @@ async def run_benchmark(
                     qr = in_flight.pop(rid, None)
                     if qr is None:
                         continue
-                    try:
-                        res = await backend.wait(rid)
-                    except Exception as e:  # noqa: BLE001
-                        res = RequestResult(
-                            request_id=rid,
-                            text="",
-                            submit_t=qr.event.t,
-                            submit_wall_t=time.monotonic(),
-                            first_token_t=0.0,
-                            complete_t=time.monotonic(),
-                            n_output_tokens=0,
-                            n_prompt_tokens=0,
-                            error=repr(e),
-                        )
-                    _record_request(
-                        qr, res, cfg, metrics, overlap, len(in_flight) + 1, sim_now,
-                        arrival_wall_t=sim_start_wall + qr.event.t / speed,
-                    )
-                    n_completed += 1
-                    if n_completed == 1 or n_completed % 50 == 0:
-                        print(f"[bench:{cfg.run_label}] progress: "
-                              f"completed={n_completed} dispatched={n_dispatched} "
-                              f"enqueued={ei}/{n_events} in_flight={len(in_flight)} "
-                              f"queue={len(queue)} sim_t={sim_now:.1f}s")
+                    await _reap(rid, qr)
 
                 wait_tasks = []
                 for rid in list(in_flight.keys()):
@@ -374,31 +475,7 @@ async def run_benchmark(
                                 qr = in_flight.pop(rid, None)
                                 if qr is None:
                                     break
-                                try:
-                                    res = await backend.wait(rid)
-                                except Exception as e:  # noqa: BLE001
-                                    res = RequestResult(
-                                        request_id=rid,
-                                        text="",
-                                        submit_t=qr.event.t,
-                                        submit_wall_t=time.monotonic(),
-                                        first_token_t=0.0,
-                                        complete_t=time.monotonic(),
-                                        n_output_tokens=0,
-                                        n_prompt_tokens=0,
-                                        error=repr(e),
-                                    )
-                                _record_request(
-                                    qr, res, cfg, metrics, overlap,
-                                    len(in_flight) + 1, sim_now,
-                                    arrival_wall_t=sim_start_wall + qr.event.t / speed,
-                                )
-                                n_completed += 1
-                                if n_completed == 1 or n_completed % 50 == 0:
-                                    print(f"[bench:{cfg.run_label}] progress: "
-                                          f"completed={n_completed} dispatched={n_dispatched} "
-                                          f"enqueued={ei}/{n_events} in_flight={len(in_flight)} "
-                                          f"queue={len(queue)} sim_t={sim_now:.1f}s")
+                                await _reap(rid, qr)
                                 break
                     if not done:
                         await asyncio.sleep(0.0)
@@ -423,9 +500,12 @@ async def run_benchmark(
                 if last_window_flushed % 5 == 0:
                     print(f"[bench:{cfg.run_label}] window {last_window_flushed} closed "
                           f"(sim_t={sim_now:.1f}s completed={n_completed})")
+    except (OverloadedRun, EngineFailure) as e:
+        aborted = e
+        raise
     finally:
         print(f"[bench:{cfg.run_label}] finalizing: dispatched={n_dispatched} "
-              f"completed={n_completed} events={n_events}")
+              f"completed={n_completed} failed={n_failed} events={n_events}")
         # Cross-check our summed per-request counters against the engine's
         # own cumulative prefix-cache accounting, BEFORE stopping it. If
         # these two disagree materially, our per-request reads are wrong
@@ -458,6 +538,8 @@ async def run_benchmark(
             os.path.join(cfg.output_dir, f"summary_{cfg.run_label}.csv"),
             index=False,
         )
+        if aborted is not None:
+            _set_aside_aborted(cfg, type(aborted).__name__)
         if should_stop:
             await backend.stop()
 
