@@ -128,6 +128,11 @@ class TurnEvent:
     # True when the session's history was trimmed to fit
     # `max_context_tokens`, which resets prefix reuse for that session.
     context_truncated: bool = False
+    # The model's reply to this turn. Engines cache the KV of generated
+    # tokens too, and in a real chat the next prompt contains this reply, so
+    # the cache simulator inserts prompt + output. Empty for synthetic
+    # workloads (their next prompt does not include a reply).
+    output_tokens: Tuple[int, ...] = ()
 
     @property
     def prompt_tokens(self) -> Tuple[int, ...]:

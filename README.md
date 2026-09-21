@@ -6,6 +6,8 @@ A request-scheduling layer built on top of [vLLM](https://github.com/vllm-projec
 
 ---
 
+> **CPU eviction study:** how much better than vLLM's LRU eviction could a smarter policy do, and what must it predict? See [CACHE_SIMULATION.md](CACHE_SIMULATION.md).
+
 ## What this is
 
 A scheduling layer (in `src/kvcache/`) that sits **in front of** a real vLLM instance and decides:
@@ -47,7 +49,7 @@ The design tension under study: an eviction / scheduling policy based only on **
 │   └── phase6_analysis.py        # Charts from existing CSVs
 ├── notebooks/
 │   ├── kaggle_launcher.ipynb     # Thin GPU launcher
-│   └── cpu_cache_headroom.ipynb  # CPU-only eviction headroom study
+│   └── cpu_cache_headroom.ipynb  # CPU-only eviction headroom study (CACHE_SIMULATION.md)
 ├── tests/test_core.py            # 14 unit + integration tests
 ├── results/                      # CSVs and figures (per-run, gitignored)
 ├── README.md                     # this file

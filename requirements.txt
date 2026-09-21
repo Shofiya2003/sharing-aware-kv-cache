@@ -20,6 +20,8 @@ transformers==4.57.6
 pandas>=2.0,<2.3
 matplotlib>=3.7,<3.10
 seaborn>=0.13,<0.14
+# WildChat parquet shards (CPU cache study only)
+pyarrow>=14
 
 # Test
 # (stdlib unittest is enough; we don't need pytest)

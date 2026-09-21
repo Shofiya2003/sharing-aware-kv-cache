@@ -39,3 +39,4 @@ results/logs/
 *.log
 
 results/cpu_headroom/
+data/

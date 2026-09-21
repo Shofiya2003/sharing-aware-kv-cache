@@ -11,6 +11,7 @@ dependencies = [
     "pandas>=2.0,<2.3",
     "matplotlib>=3.7,<3.10",
     "seaborn>=0.13,<0.14",
+    "pyarrow>=14",  # WildChat parquet shards (CPU cache study)
     # Note: numpy is intentionally NOT a direct dep — vLLM owns the numpy
     # install on the GPU host. Listing numpy here causes pip to upgrade it
     # under vLLM, leading to:

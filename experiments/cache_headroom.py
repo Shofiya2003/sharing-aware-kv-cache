@@ -35,6 +35,11 @@ PRESETS: Dict[str, dict] = {
     # Round 3: 12 sessions x 600 s. The T4 measured cached_token_rate
     # 0.546 on seed 0 (fifo_constrained), which anchors the capacity axis.
     "arm1_round3": dict(num_sessions=12, sim_window_s=600, **_ARM1),
+    # Round 3 with context truncation switched off (cap far above any
+    # session's length). Isolates why return-time eviction loses to LRU
+    # when truncation is on: see CACHE_SIMULATION.md, finding 3.
+    "arm1_round3_notrunc": dict(num_sessions=12, sim_window_s=600,
+                                **{**_ARM1, "max_context_tokens": 10**6}),
     # Arm 2 (cell 3e): shared doc at token 0 of every prompt vs mid-prompt.
     "arm2_preamble": dict(num_sessions=20, sim_window_s=300,
                           shared_attach_position="session_preamble", **_ARM2),
