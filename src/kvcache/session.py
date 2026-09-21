@@ -143,3 +143,46 @@ def sample_turn_tokens(
     size = rng.randint(min_size, max_size)
     return tuple(rng.choice(unique_vocab) for _ in range(size))
 
+
+
+# A gap between two of a session's turns longer than this (sim seconds)
+# counts as an idle period. The generator's active inter-turn gap is
+# exponential with mean 1 s (P(>5 s) < 1%) and its idle gaps average 25 s.
+IDLE_GAP_THRESHOLD_S = 5.0
+
+
+class LiveSessions(dict):
+    """session_id -> Session, built ONLY from turns that have been served.
+
+    The generator's `workload.sessions` is filled in for the whole run
+    before it starts: its `turns`, `turn_count`, `last_turn_t` and idle-gap
+    statistics describe the session's FUTURE. Policies used to read those,
+    so "session-aware" amounted to "serve the sessions that will have the
+    most turns in total" -- oracle knowledge, not a return prediction.
+
+    The benchmark calls `observe()` as each request completes, so a policy
+    scoring the queue at time `now` sees exactly the history a real
+    serving system would have.
+    """
+
+    def __init__(self, idle_gap_threshold_s: float = IDLE_GAP_THRESHOLD_S):
+        super().__init__()
+        self.idle_gap_threshold_s = idle_gap_threshold_s
+
+    def observe(self, session_id: str, turn_index: int, t: float,
+                tokens: Tuple[int, ...] = (), role: str = "user") -> Session:
+        sess = self.get(session_id)
+        if sess is None:
+            sess = Session(session_id=session_id, start_t=t, state="ACTIVE")
+            self[session_id] = sess
+        prev = sess.last_turn_t
+        # A session can have two turns in flight and they can complete out
+        # of order; only a later turn moves the clock or counts as a gap.
+        if prev is None or t >= prev:
+            if prev is not None and t - prev > self.idle_gap_threshold_s:
+                sess.total_idle_intervals += 1
+                sess.sum_idle_gap += t - prev
+                sess.last_active_end_t = prev
+            sess.last_turn_t = t
+        sess.turns.append(Turn(turn_index=turn_index, t=t, tokens=tuple(tokens), role=role))
+        return sess

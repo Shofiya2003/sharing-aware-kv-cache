@@ -29,7 +29,8 @@ The design tension under study: an eviction / scheduling policy based only on **
 .
 ├── src/kvcache/                  # Core package
 │   ├── session.py                # Multi-turn session lifecycle
-│   ├── overlap.py                # Alignment-robust n-gram overlap detector
+│   ├── prefix.py                 # vLLM-style chained block hashes (what is reusable)
+│   ├── cachesim.py               # CPU model of the prefix cache (eviction headroom)
 │   ├── workload.py               # Multi-session workload generator
 │   ├── policies.py               # 4 dispatch policies (no cache mutation)
 │   ├── vllm_backend.py           # Async wrapper around vLLM
@@ -45,7 +46,8 @@ The design tension under study: an eviction / scheduling policy based only on **
 │   ├── phase5_matrix.py          # 4x2 matrix runner
 │   └── phase6_analysis.py        # Charts from existing CSVs
 ├── notebooks/
-│   └── kaggle_launcher.ipynb     # Thin GPU launcher
+│   ├── kaggle_launcher.ipynb     # Thin GPU launcher
+│   └── cpu_cache_headroom.ipynb  # CPU-only eviction headroom study
 ├── tests/test_core.py            # 14 unit + integration tests
 ├── results/                      # CSVs and figures (per-run, gitignored)
 ├── README.md                     # this file
@@ -90,12 +92,12 @@ python experiments/run_experiment.py --mock
 |---|---|---|
 | `fifo` | arrival order | nothing in particular |
 | `session-aware` | high session return-likelihood + large context | sessions likely to return soon |
-| `sharing-aware` | high cross-session n-gram overlap | blocks shared by ≥2 live sessions |
+| `sharing-aware` | longest prompt prefix (whole 16-token blocks from token 0) that other sessions recently sent | cross-session prefix blocks vLLM can actually reuse |
 | `combined` | α · session_score + (1−α) · sharing_score | both signals jointly |
 
 Default α = 0.5. Sweep α in `phase5_matrix.py --combined-alpha <v>` to find the best on your workload.
 
-The policies operate on a `QueuedRequest` priority queue: the driver re-scores the queue before each submission. This means a request that *becomes* more valuable (because a new live session now shares its n-grams) can be re-promoted in real time.
+The policies operate on a `QueuedRequest` priority queue: the driver re-scores the queue before each submission. This means a request that *becomes* more valuable (because another session has just sent the same prompt opening) can be re-promoted in real time.
 
 ## Hit/miss classification — ground truth, not a proxy
 

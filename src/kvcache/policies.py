@@ -19,8 +19,9 @@ The four policies
 1. FIFO (naive):    submit in arrival order. No signal awareness.
 2. Session-aware:   prioritize sessions likely to return soon and sessions
                      with expensive accumulated context.
-3. Sharing-aware:   prioritize requests whose content overlaps with other
-                     live sessions' content.
+3. Sharing-aware:   prioritize requests whose prompt OPENING matches blocks
+                     other sessions recently sent -- the only cross-session
+                     content vLLM's prefix cache can reuse (see prefix.py).
 4. Combined:        weighted sum of session and sharing signals.
 """
 
@@ -59,12 +60,12 @@ class DispatchPolicy:
         self,
         queue: List[QueuedRequest],
         sessions: Dict[str, Session],
-        overlap_index: OverlapIndex,
+        prefix_index: PrefixIndex,
         now: float,
     ) -> DispatchDecision:
         raise NotImplementedError
 
-from .overlap import OverlapIndex, ngrams, ngram_id
+from .prefix import PrefixIndex
 from .session import Session
 from .workload import TurnEvent
 
@@ -78,7 +79,7 @@ class FIFOPolicy(DispatchPolicy):
         self,
         queue: List[QueuedRequest],
         sessions: Dict[str, Session],
-        overlap_index: OverlapIndex,
+        prefix_index: PrefixIndex,
         now: float,
     ) -> DispatchDecision:
         ordered = sorted(queue, key=lambda q: (q.arrival_t, q.enqueue_seq))
@@ -99,7 +100,7 @@ class SessionAwarePolicy(DispatchPolicy):
         self,
         queue: List[QueuedRequest],
         sessions: Dict[str, Session],
-        overlap_index: OverlapIndex,
+        prefix_index: PrefixIndex,
         now: float,
     ) -> DispatchDecision:
         def score(q: QueuedRequest) -> float:
@@ -121,40 +122,35 @@ class SessionAwarePolicy(DispatchPolicy):
         )
 
 
-def _sharing_count(q: QueuedRequest, overlap_index: OverlapIndex, cap: int = 20) -> int:
-    """Count distinct other sessions whose referenced n-grams overlap with
-    this request's prompt. Used by SharingAwarePolicy and CombinedPolicy.
+def _shared_prefix_tokens(q: QueuedRequest, prefix_index: PrefixIndex) -> int:
+    """Leading prompt tokens this request shares with other sessions.
 
-    Scores the full accumulated prompt (`prompt_tokens`), not just this
-    turn's delta, so that sharing inherited from earlier turns still counts
-    -- the prompt is what occupies cache blocks.
+    Counted in whole KV blocks from token 0, the way vLLM matches them, so
+    it is the cross-session reuse vLLM could actually deliver if those
+    blocks are still cached. Shared text anywhere else in the prompt
+    scores nothing: vLLM cannot reuse it (the old 8-gram detector counted
+    it, which is why sharing-aware could never show an effect).
     """
-    other_sids = set()
-    for gram in ngrams(q.event.prompt_tokens, overlap_index.n):
-        gid = ngram_id(gram)
-        for sid in overlap_index._refs.get(gid, ()):  # noqa: SLF001
-            if sid != q.event.session_id:
-                other_sids.add(sid)
-    return min(len(other_sids), cap)
+    n, _others = prefix_index.shared_prefix(q.event.session_id, q.event.prompt_tokens)
+    return n
 
 
 class SharingAwarePolicy(DispatchPolicy):
-    """Sharing-aware: prioritize requests whose content overlaps with
-    content already referenced by other live sessions."""
+    """Sharing-aware: prioritize requests whose opening blocks match
+    prompts other sessions sent recently, i.e. whose prefix another
+    session may have left in the cache. Serving them first reuses those
+    blocks before other traffic evicts them."""
 
     name = "sharing-aware"
-
-    def __init__(self, max_share_cap: int = 20) -> None:
-        self.max_share_cap = max_share_cap
 
     def score_queue(
         self,
         queue: List[QueuedRequest],
         sessions: Dict[str, Session],
-        overlap_index: OverlapIndex,
+        prefix_index: PrefixIndex,
         now: float,
     ) -> DispatchDecision:
-        counts = [_sharing_count(q, overlap_index, self.max_share_cap) for q in queue]
+        counts = [_shared_prefix_tokens(q, prefix_index) for q in queue]
         max_c = max(counts) if counts else 1
         max_c = max(max_c, 1)
         scores = [c / max_c for c in counts]
@@ -165,7 +161,7 @@ class SharingAwarePolicy(DispatchPolicy):
         ordered = [q for q, _ in indexed]
         return DispatchDecision(
             ordered=ordered,
-            notes={"policy": self.name, "overlap_counts": counts, "scores": scores},
+            notes={"policy": self.name, "shared_prefix_tokens": counts, "scores": scores},
         )
 
 
@@ -181,7 +177,6 @@ class CombinedPolicy(DispatchPolicy):
 
     name = "combined"
     alpha: float = 0.5
-    max_share_cap: int = 20
 
     def _session_score(self, q: QueuedRequest, sessions: Dict[str, Session], now: float) -> float:
         sess = sessions.get(q.event.session_id)
@@ -195,14 +190,14 @@ class CombinedPolicy(DispatchPolicy):
         self,
         queue: List[QueuedRequest],
         sessions: Dict[str, Session],
-        overlap_index: OverlapIndex,
+        prefix_index: PrefixIndex,
         now: float,
     ) -> DispatchDecision:
         sess_scores = [self._session_score(q, sessions, now) for q in queue]
-        raw_overlap = [_sharing_count(q, overlap_index, self.max_share_cap) for q in queue]
-        max_c = max(raw_overlap) if raw_overlap else 1
+        raw_shared = [_shared_prefix_tokens(q, prefix_index) for q in queue]
+        max_c = max(raw_shared) if raw_shared else 1
         max_c = max(max_c, 1)
-        share_scores = [c / max_c for c in raw_overlap]
+        share_scores = [c / max_c for c in raw_shared]
         a = self.alpha
         combined = [a * s + (1.0 - a) * sh for s, sh in zip(sess_scores, share_scores)]
         indexed = sorted(

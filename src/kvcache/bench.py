@@ -13,8 +13,9 @@ Per-workload-event flow:
   5. As requests complete, the driver:
        - reads vLLM's ground-truth `num_cached_tokens` for the request
        - records a `RequestRecord` into the `MetricsLogger`
-       - touches the overlap index with the request's tokens so future
-         sharing-aware decisions can see them
+       - adds the request's prompt blocks to the prefix index so future
+         sharing-aware decisions can see them, and records the turn in
+         the live session table (the only session state policies see)
        - flushes any completed time-window
 
 Hit/miss classification
@@ -52,7 +53,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from .metrics import MetricsConfig, MetricsLogger, RequestRecord
-from .overlap import OverlapIndex, ngrams, ngram_id
+from .prefix import PrefixIndex
 from .policies import (
     CombinedPolicy,
     DispatchPolicy,
@@ -61,7 +62,7 @@ from .policies import (
     SessionAwarePolicy,
     SharingAwarePolicy,
 )
-from .session import Session
+from .session import LiveSessions, Session
 from .vllm_backend import BackendConfig, RequestResult, VLLMBackend, tokens_to_text
 from .workload import Workload
 
@@ -179,7 +180,8 @@ def _record_request(
     res: RequestResult,
     cfg: BenchConfig,
     metrics: MetricsLogger,
-    overlap: OverlapIndex,
+    prefix_index: PrefixIndex,
+    live_sessions: LiveSessions,
     in_flight_at_submit: int,
     sim_complete_t: float,
     arrival_wall_t: Optional[float] = None,
@@ -210,13 +212,13 @@ def _record_request(
     proxy_hit = _classify_hit_latency_proxy(
         latency_ms, cfg.hit_latency_threshold_ms
     )
-    other_refs = set()
-    for gram in ngrams(qr.event.prompt_tokens, overlap.n):
-        gid = ngram_id(gram)
-        for sid in overlap._refs.get(gid, ()):  # noqa: SLF001
-            if sid != qr.event.session_id:
-                other_refs.add(sid)
-    shared = len(other_refs) > 0
+    # "Shared" = the prompt opens with at least one full KV block that
+    # another session sent before, i.e. cross-session reuse vLLM could
+    # deliver. (It used to mean "any 8 tokens seen elsewhere, at any
+    # position", which vLLM can never reuse.)
+    shared_tokens, _others = prefix_index.shared_prefix(
+        qr.event.session_id, qr.event.prompt_tokens)
+    shared = shared_tokens > 0
     # Bucket by the event's request time (the moment the user wanted
     # the turn), not the completion time. This way a request's row
     # belongs to the window its prompt was issued in, which is the
@@ -245,7 +247,9 @@ def _record_request(
             error=res.error is not None,
         )
     )
-    overlap.touch_session(qr.event.session_id, qr.event.prompt_tokens)
+    prefix_index.add(qr.event.session_id, qr.event.prompt_tokens)
+    live_sessions.observe(qr.event.session_id, qr.event.turn_index,
+                          qr.event.t, qr.event.tokens, qr.event.role)
 
 
 def _set_aside_aborted(cfg: BenchConfig, reason: str) -> None:
@@ -293,9 +297,16 @@ async def run_benchmark(
     else:
         should_stop = False
 
-    sessions: Dict[str, Session] = {s.session_id: s for s in workload.sessions}
+    # Built from served turns only. `workload.sessions` holds each session's
+    # whole future (every turn it will ever send), and policies reading it
+    # were ranking sessions by their total turn count -- an oracle.
+    sessions = LiveSessions()
     policy = make_policy(cfg.policy_name, alpha=cfg.combined_alpha)
-    overlap = OverlapIndex(n=8)
+    # Unbounded, so a match may already have been evicted by vLLM: this
+    # records what other sessions SENT, not what the engine still holds
+    # (vLLM does not expose its block pool to the caller). The CPU cache
+    # simulator (cachesim.py) is where eviction is modelled explicitly.
+    prefix_index = PrefixIndex()
 
     metrics = MetricsLogger(
         MetricsConfig(
@@ -346,7 +357,7 @@ async def run_benchmark(
                 error=repr(e),
             )
         _record_request(
-            qr, res, cfg, metrics, overlap, len(in_flight) + 1, sim_now,
+            qr, res, cfg, metrics, prefix_index, sessions, len(in_flight) + 1, sim_now,
             arrival_wall_t=sim_start_wall + qr.event.t / speed,
         )
         n_completed += 1
@@ -429,7 +440,7 @@ async def run_benchmark(
                     )
 
             # 3. Re-score the queue with the active policy
-            decision = policy.score_queue(queue, sessions, overlap, sim_now)
+            decision = policy.score_queue(queue, sessions, prefix_index, sim_now)
             queue = list(decision.ordered)
 
             # 4. Dispatch up to vLLM's concurrency limit

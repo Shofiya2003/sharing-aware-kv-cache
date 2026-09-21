@@ -9,7 +9,9 @@ Top-level components:
 
   - `session`, `workload`: multi-session workload generator with
     built-in cross-session content overlap
-  - `overlap`: alignment-robust n-gram overlap detector
+  - `prefix`: vLLM-style chained block hashes; what another session's
+    prompt could let the engine reuse
+  - `cachesim`: CPU model of the prefix cache for eviction-headroom studies
   - `policies`: four dispatch policies (FIFO / session-aware /
     sharing-aware / combined)
   - `vllm_backend`: thin async wrapper around `vllm.AsyncLLMEngine`
@@ -18,8 +20,8 @@ Top-level components:
   - `analysis`: headline / ablation / fairness charts from CSV results
 """
 
-from .session import Session, Turn
-from .overlap import OverlapIndex, ngrams, ngram_id, detect_shared_ngrams
+from .session import LiveSessions, Session, Turn
+from .prefix import BLOCK_SIZE, PrefixIndex, block_hashes
 from .workload import Workload, WorkloadConfig, TurnEvent, generate_workload
 from .policies import (
     DispatchPolicy,
@@ -43,12 +45,12 @@ from .bench import BenchConfig, RunSummary, run_benchmark, MockVLLMBackend
 from .analysis import RunSet, run_analysis
 
 __all__ = [
+    "LiveSessions",
     "Session",
     "Turn",
-    "OverlapIndex",
-    "ngrams",
-    "ngram_id",
-    "detect_shared_ngrams",
+    "BLOCK_SIZE",
+    "PrefixIndex",
+    "block_hashes",
     "Workload",
     "WorkloadConfig",
     "TurnEvent",

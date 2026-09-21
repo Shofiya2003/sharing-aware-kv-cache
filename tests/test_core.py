@@ -17,8 +17,8 @@ SRC = os.path.join(os.path.dirname(HERE), "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from kvcache.session import Session, Turn  # noqa: E402
-from kvcache.overlap import OverlapIndex, ngrams, ngram_id, detect_shared_ngrams  # noqa: E402
+from kvcache.session import LiveSessions, Session, Turn  # noqa: E402
+from kvcache.prefix import BLOCK_SIZE, PrefixIndex, block_hashes  # noqa: E402
 from kvcache.workload import WorkloadConfig, generate_workload  # noqa: E402
 from kvcache.policies import (  # noqa: E402
     FIFOPolicy,
@@ -50,30 +50,110 @@ class TestSession(unittest.TestCase):
         self.assertLessEqual(rl, 1.0)
 
 
-class TestOverlap(unittest.TestCase):
-    def test_ngram_id_is_stable(self):
-        a = ngram_id((1, 2, 3, 4, 5, 6, 7, 8))
-        b = ngram_id((1, 2, 3, 4, 5, 6, 7, 8))
-        self.assertEqual(a, b)
+class TestPrefixIndex(unittest.TestCase):
+    """Sharing must mean what vLLM can reuse: identical from token 0."""
 
-    def test_detect_shared_ngrams_prefix_overlap(self):
-        a = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
-        b = (1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99)
-        self.assertGreaterEqual(detect_shared_ngrams(a, b, n=8), 1)
+    DOC = tuple(range(1000, 1000 + 3 * BLOCK_SIZE))
 
-    def test_detect_shared_ngrams_mid_overlap(self):
-        a = (0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
-        b = (99, 99, 99, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 99, 99, 99)
-        self.assertGreaterEqual(detect_shared_ngrams(a, b, n=8), 1)
+    def test_hashes_chain_from_token_zero(self):
+        a = block_hashes(self.DOC + (1,) * BLOCK_SIZE)
+        b = block_hashes(self.DOC + (2,) * BLOCK_SIZE)
+        self.assertEqual(a[:3], b[:3])
+        self.assertNotEqual(a[3], b[3])
 
-    def test_overlap_index_other_refs(self):
-        idx = OverlapIndex(n=8)
-        a = (0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
-        idx.touch_session("s0", a)
-        b = (99, 99, 99, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 99, 99, 99)
-        others = idx.has_other_refs("s1", b)
-        self.assertIn("s0", others)
-        self.assertNotIn("s1", others)
+    def test_same_text_mid_prompt_does_not_match(self):
+        # The same block of text after a different opening hashes
+        # differently -- exactly why vLLM cannot reuse it.
+        a = block_hashes(self.DOC)
+        b = block_hashes((7,) * BLOCK_SIZE + self.DOC)
+        self.assertFalse(set(a) & set(b))
+
+    def test_only_full_blocks_count(self):
+        self.assertEqual(len(block_hashes(tuple(range(2 * BLOCK_SIZE - 1)))), 1)
+
+    def test_shared_prefix_counts_other_sessions_only(self):
+        idx = PrefixIndex()
+        idx.add("s0", self.DOC + (5,) * BLOCK_SIZE)
+        n, others = idx.shared_prefix("s1", self.DOC + (9,) * BLOCK_SIZE)
+        self.assertEqual(n, 3 * BLOCK_SIZE)
+        self.assertEqual(others, {"s0"})
+        # A session's own history is not sharing.
+        self.assertEqual(idx.shared_prefix("s0", self.DOC)[0], 0)
+
+    def test_mid_prompt_doc_is_not_shared(self):
+        idx = PrefixIndex()
+        idx.add("s0", (1,) * BLOCK_SIZE + self.DOC)
+        self.assertEqual(idx.shared_prefix("s1", (2,) * BLOCK_SIZE + self.DOC)[0], 0)
+
+    def test_capacity_forgets_least_recent(self):
+        idx = PrefixIndex(capacity_blocks=3)
+        idx.add("s0", self.DOC)
+        idx.add("s1", (4,) * BLOCK_SIZE)
+        self.assertEqual(len(idx), 3)
+        self.assertEqual(idx.cached_prefix(self.DOC), 0)  # its block 0 went first
+
+
+class TestLiveSessions(unittest.TestCase):
+    """Policies must only see history that has already happened."""
+
+    def test_state_reflects_only_observed_turns(self):
+        live = LiveSessions()
+        live.observe("s0", 0, 1.0)
+        live.observe("s0", 1, 2.0)
+        s = live["s0"]
+        self.assertEqual(s.turn_count, 2)
+        self.assertEqual(s.last_turn_t, 2.0)
+        self.assertEqual(s.total_idle_intervals, 0)
+
+    def test_idle_gap_recorded(self):
+        live = LiveSessions(idle_gap_threshold_s=5.0)
+        live.observe("s0", 0, 0.0)
+        live.observe("s0", 1, 30.0)
+        self.assertEqual(live["s0"].total_idle_intervals, 1)
+        self.assertAlmostEqual(live["s0"].avg_idle_gap(), 30.0)
+
+    def test_out_of_order_completion_does_not_rewind(self):
+        live = LiveSessions()
+        live.observe("s0", 1, 10.0)
+        live.observe("s0", 0, 9.0)
+        self.assertEqual(live["s0"].last_turn_t, 10.0)
+        self.assertEqual(live["s0"].turn_count, 2)
+
+    def test_benchmark_policy_never_sees_future_turns(self):
+        """Every time a policy scores the queue, each session's history
+        must contain only turns issued at or before `now`."""
+        from kvcache import bench as B
+
+        w = generate_workload(WorkloadConfig(num_sessions=4, sim_window_s=20, seed=3,
+                                             mean_idle_gap_s=3))
+        seen_violation = []
+        calls = []
+
+        class Spy(SessionAwarePolicy):
+            def score_queue(self, queue, sessions, prefix_index, now):
+                calls.append(now)
+                for sess in sessions.values():
+                    if any(t.t > now + 1e-9 for t in sess.turns):
+                        seen_violation.append(sess.session_id)
+                return super().score_queue(queue, sessions, prefix_index, now)
+
+        orig = B.make_policy
+        B.make_policy = lambda name, alpha=0.5: Spy()
+        try:
+            async def go():
+                with tempfile.TemporaryDirectory() as tmp:
+                    backend = MockVLLMBackend(BackendConfig(max_num_seqs=2))
+                    await backend.start()
+                    cfg = BenchConfig(policy_name="session-aware",
+                                      backend=BackendConfig(max_num_seqs=2),
+                                      max_new_tokens=4, speed_factor=20.0,
+                                      output_dir=tmp, run_label="spy")
+                    await run_benchmark(w, cfg, backend=backend)
+            asyncio.run(go())
+        finally:
+            B.make_policy = orig
+        self.assertGreater(len(calls), 10)
+        self.assertEqual(seen_violation, [])
 
 
 class TestWorkload(unittest.TestCase):
@@ -106,7 +186,7 @@ class TestPolicies(unittest.TestCase):
         w = generate_workload(WorkloadConfig(num_sessions=3, sim_window_s=30, seed=1))
         events = w.events[:5]
         queue = [QueuedRequest(event=e, arrival_t=e.t, enqueue_seq=i) for i, e in enumerate(events)]
-        d = FIFOPolicy().score_queue(queue, {s.session_id: s for s in w.sessions}, OverlapIndex(n=8), 0.0)
+        d = FIFOPolicy().score_queue(queue, LiveSessions(), PrefixIndex(), 0.0)
         out_ts = [q.event.t for q in d.ordered]
         self.assertEqual(out_ts, sorted(out_ts))
 
@@ -122,8 +202,9 @@ class TestPolicies(unittest.TestCase):
         s_solo.last_turn_t = 0.0
         sess_map = {"sharer": s_sharer, "solo": s_solo}
 
-        oi = OverlapIndex(n=8)
-        oi.touch_session("earlier", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20))
+        oi = PrefixIndex()
+        # Another session already sent a prompt with the sharer's opening.
+        oi.add("earlier", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20))
 
         sharer_tokens = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)
         solo_tokens = tuple(range(100, 100 + 8))
@@ -639,3 +720,39 @@ class TestEngineFailure(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class TestCacheSim(unittest.TestCase):
+    """The CPU prefix-cache model behind notebooks/cpu_cache_headroom.ipynb."""
+
+    @staticmethod
+    def _events():
+        return generate_workload(WorkloadConfig(
+            num_sessions=5, sim_window_s=120, seed=2, max_context_tokens=1024,
+            turn_min_tokens=16, turn_max_tokens=48)).events
+
+    def test_repeat_prompt_reuses_all_but_last_block(self):
+        from kvcache.cachesim import simulate
+        from kvcache.workload import TurnEvent
+        toks = tuple(range(5 * BLOCK_SIZE))
+        ev = [TurnEvent("a", 0, 0.0, toks, "user", True, toks),
+              TurnEvent("b", 0, 1.0, toks, "user", True, toks)]
+        r = simulate(ev, None)
+        # vLLM recomputes at least one token, so the last full block is not reused.
+        self.assertEqual(r.cached_tokens, 4 * BLOCK_SIZE)
+
+    def test_policies_are_bounded_by_oracle_and_ceiling(self):
+        from kvcache.cachesim import POLICIES, simulate
+        ev = self._events()
+        ceil = simulate(ev, None).cached_token_rate
+        for cap in (40, 120):
+            r = {p: simulate(ev, cap, p).cached_token_rate for p in POLICIES}
+            for p in POLICIES:
+                self.assertLessEqual(r[p], ceil + 1e-12, (cap, p))
+            self.assertGreaterEqual(r["oracle"] + 1e-12, r["lru"], cap)
+
+    def test_lru_improves_with_capacity(self):
+        from kvcache.cachesim import simulate
+        ev = self._events()
+        rates = [simulate(ev, c, "lru").cached_token_rate for c in (20, 60, 200, 2000)]
+        self.assertEqual(rates, sorted(rates))

@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from kvcache.overlap import OverlapIndex
+from kvcache.prefix import PrefixIndex
 from kvcache.policies import (
     CombinedPolicy,
     FIFOPolicy,
@@ -43,11 +43,12 @@ def main() -> int:
         QueuedRequest(event=e, arrival_t=e.t, enqueue_seq=i) for i, e in enumerate(events)
     ]
     sessions = {s.session_id: s for s in w.sessions}
-    oi = OverlapIndex(n=8)
-    # Pretend earlier content is "in the index" so sharing signals are visible
+    oi = PrefixIndex()
+    # Pretend some other session already sent each sharer's prompt opening,
+    # so the sharing signal is visible on this constructed example.
     for e in events:
         if e.session_id in w.sharing_sids:
-            oi.touch_session(e.session_id, e.tokens)
+            oi.add("__other__", e.prompt_tokens)
 
     print(f"[phase4] testing {len(queue)} queued requests with {len(w.sharing_sids)} sharers")
     orderings = {}

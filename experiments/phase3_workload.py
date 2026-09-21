@@ -22,7 +22,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from kvcache.workload import WorkloadConfig, generate_workload
-from kvcache.overlap import ngrams, ngram_id
+from kvcache.prefix import PrefixIndex
 
 
 def plot_timeline(workload, out_path: str) -> None:
@@ -64,50 +64,29 @@ def plot_timeline(workload, out_path: str) -> None:
 
 
 def report_overlap(workload) -> None:
-    """Report the measured cross-session overlap.
+    """Report cross-session sharing the engine could actually reuse.
 
-    For each point in time, count the fraction of currently-live sessions
-    whose most recent n-grams are referenced by at least one other live
-    session. Then average across the simulation.
+    Replays the prompts in arrival order through a PrefixIndex and, for
+    each request, counts the leading tokens it shares with prompts OTHER
+    sessions sent earlier (whole 16-token blocks from token 0, as vLLM
+    matches them). Shared text anywhere else in a prompt counts for
+    nothing, because vLLM cannot reuse it.
     """
-    # Build per-session n-gram sets over time.
-    n = 8
-    per_sess_grams = defaultdict(set)
-    samples = []
-    sim_window = workload.config.sim_window_s
-    sample_dt = 5.0
-    t = 0.0
-    event_idx = 0
-    sorted_events = sorted(workload.events, key=lambda e: e.t)
-
-    while t <= sim_window:
-        while event_idx < len(sorted_events) and sorted_events[event_idx].t <= t:
-            ev = sorted_events[event_idx]
-            for gram in ngrams(ev.tokens, n):
-                per_sess_grams[ev.session_id].add(ngram_id(gram))
-            event_idx += 1
-        live_sids = [s.session_id for s in workload.sessions if s.start_t <= t]
-        if live_sids:
-            sharing = 0
-            for sid in live_sids:
-                others = set()
-                for gid in per_sess_grams[sid]:
-                    # Is this gid in any other session's set?
-                    for other in live_sids:
-                        if other != sid and gid in per_sess_grams[other]:
-                            others.add(other)
-                            break
-                if others:
-                    sharing += 1
-            frac = sharing / len(live_sids)
-        else:
-            frac = 0.0
-        samples.append(frac)
-        t += sample_dt
-
-    avg = sum(samples) / max(1, len(samples))
-    print(f"[phase3] average fraction of live sessions with cross-session overlap: {avg:.3f}")
-    print(f"[phase3] samples: {len(samples)} across sim window {sim_window}s")
+    idx = PrefixIndex()
+    n_shared = 0
+    shared_tok = 0
+    prompt_tok = 0
+    for ev in sorted(workload.events, key=lambda e: e.t):
+        n, _others = idx.shared_prefix(ev.session_id, ev.prompt_tokens)
+        n_shared += n > 0
+        shared_tok += n
+        prompt_tok += len(ev.prompt_tokens)
+        idx.add(ev.session_id, ev.prompt_tokens)
+    n_ev = max(1, len(workload.events))
+    print(f"[phase3] requests opening with another session's blocks: "
+          f"{n_shared}/{len(workload.events)} ({n_shared / n_ev:.1%})")
+    print(f"[phase3] cross-session reusable prefix: "
+          f"{shared_tok / max(1, prompt_tok):.2%} of all prompt tokens")
     print(
         f"[phase3] sharing sessions in workload: {len(workload.sharing_sids)} "
         f"/ {len(workload.sessions)} total"

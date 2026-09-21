@@ -38,3 +38,4 @@ results/INTERPRETATION.md
 results/logs/
 *.log
 
+results/cpu_headroom/
