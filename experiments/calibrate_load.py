@@ -72,6 +72,7 @@ async def measure_capacity(
     max_new_tokens: int,
     prompts: list,
     duration_s: float,
+    enforce_eager: bool = False,
 ) -> dict:
     """Closed-loop: keep exactly `max_num_seqs` requests in flight.
 
@@ -84,6 +85,7 @@ async def measure_capacity(
         gpu_memory_utilization=gpu_memory,
         max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
+        enforce_eager=enforce_eager,
     ))
     await backend.start()
     try:
@@ -161,6 +163,10 @@ def main() -> int:
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--max-new-tokens", type=int, default=24)
     p.add_argument("--duration-s", type=float, default=180.0)
+    p.add_argument("--enforce-eager", action="store_true",
+                   help="Disable CUDA graphs / compilation. The launcher's "
+                        "fallback when the engine will not start otherwise; "
+                        "recorded in the JSON so the matrix runs the same way.")
     p.add_argument("--target-peak-utilization", type=float, default=0.9,
                    help="Offered prompt-token load in the workload's busiest "
                         "30 s window, as a fraction of measured capacity.")
@@ -201,9 +207,18 @@ def main() -> int:
     print(f"[calibrate] probing capacity at gpu_mem={args.gpu_memory} "
           f"max_num_seqs={args.max_num_seqs} for {args.duration_s:.0f}s on "
           f"{len(prompts)} end-of-run prompts ...")
-    m = asyncio.run(measure_capacity(
-        args.gpu_memory, args.max_num_seqs, args.max_model_len,
-        args.max_new_tokens, prompts, args.duration_s))
+    try:
+        m = asyncio.run(measure_capacity(
+            args.gpu_memory, args.max_num_seqs, args.max_model_len,
+            args.max_new_tokens, prompts, args.duration_s,
+            enforce_eager=args.enforce_eager))
+    except Exception:  # noqa: BLE001
+        # Print it here, on stdout, so it lands in the launcher's log next
+        # to everything else instead of in a truncated stderr tail.
+        import traceback
+        print("[calibrate] capacity probe FAILED:", flush=True)
+        traceback.print_exc(file=sys.stdout)
+        return 1
 
     print()
     print("=" * 70)
@@ -217,7 +232,8 @@ def main() -> int:
     print(f"  engine prefix hit rate: {m['engine_prefix_cache_hit_rate']}")
     cap = m["prompt_tok_per_s"]
     if cap <= 0 or m["completed"] < 5:
-        print("[calibrate] too few completions to trust; not recommending a rate")
+        print(f"[calibrate] only {m['completed']} requests completed in "
+              f"{m['elapsed_s']:.0f}s -- too few to trust; not recommending a rate")
         return 1
     peak_rate = cap * args.target_peak_utilization
 
@@ -261,6 +277,7 @@ def main() -> int:
                 "target_peak_utilization": args.target_peak_utilization,
                 "gpu_memory": args.gpu_memory,
                 "max_num_seqs": args.max_num_seqs,
+                "enforce_eager": bool(args.enforce_eager),
                 "mean_prompt_tokens": m["mean_prompt_tokens"],
                 "num_sessions": ns,
                 "sim_window_s": window,

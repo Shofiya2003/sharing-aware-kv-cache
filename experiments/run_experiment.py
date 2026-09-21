@@ -73,6 +73,7 @@ async def run_single(
             max_num_seqs=args.max_num_seqs,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=gpu_mem,
+            enforce_eager=args.enforce_eager,
         ),
         capacity_setting=capacity,
         max_new_tokens=args.max_new_tokens,
@@ -248,6 +249,10 @@ def main() -> int:
     p.add_argument("--max-num-seqs", type=int, default=4)
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--max-new-tokens", type=int, default=24)
+    p.add_argument("--enforce-eager", action="store_true",
+                   help="Disable CUDA graphs. Must match the calibration "
+                        "(load_calibration.json enforce_eager), or the "
+                        "offered load was measured on a different engine.")
     p.add_argument("--generous-gpu-mem", type=float, default=0.7)
     p.add_argument("--constrained-gpu-mem", type=float, default=0.3)
     p.add_argument("--speed-factor", type=float, default=10.0)

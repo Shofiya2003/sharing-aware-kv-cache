@@ -208,6 +208,32 @@ def wait_for_gpu_free(limit_mib: int = 1024, timeout_s: float = 180.0) -> None:
         print(f"[launcher] GPU free after {time.monotonic() - t0:.0f}s")
 
 
+def run_logged(cmd: List[str], env: Dict[str, str], log_path: str) -> int:
+    """Run `cmd`, streaming its output live AND into `log_path`.
+
+    The old capture_output + print-the-tail pattern hid the one line that
+    mattered when the calibration died: the notebook showed only
+    "calibration failed".
+    """
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    with open(log_path, "a") as log:
+        log.write(f"\n===== {time.strftime('%H:%M:%S')} {' '.join(cmd)}\n")
+        proc = subprocess.Popen(cmd, env={**env, "PYTHONUNBUFFERED": "1"},
+                                text=True, bufsize=1,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            log.write(line)
+        return proc.wait()
+
+
+def tail(path: str, n: int = 60) -> str:
+    try:
+        return "".join(open(path).readlines()[-n:])
+    except OSError:
+        return ""
+
+
 def _run_with_deadline(cmd: List[str], env: Dict[str, str],
                        timeout_s: Optional[float]) -> int:
     """subprocess.run, but a timeout kills the whole process group.
