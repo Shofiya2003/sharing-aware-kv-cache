@@ -63,6 +63,12 @@ from kvcache.workload import WorkloadConfig, generate_workload
 
 PEAK_WINDOW_S = 30.0   # must match run_experiment.PEAK_WINDOW_S
 RUN_OVERHEAD_S = 150   # engine start + warmup + drain (launcher_utils)
+STALE_NOTEBOOK = (
+        "*** Your Kaggle notebook is OUT OF DATE. Cell 1 pulls the latest scripts, "
+        "but the notebook cells are the copy you uploaded. Re-import it: File -> "
+        "Import Notebook -> GitHub URL "
+        "https://github.com/Shofiya2003/sharing-aware-kv-cache/blob/main/notebooks/kaggle_launcher.ipynb "
+        "then Run -> Restart Session and run all cells again.")
 
 
 async def measure_capacity(
@@ -189,7 +195,14 @@ def main() -> int:
                    help="Stored in the JSON so a later session can tell it "
                         "belongs to the round it is resuming.")
     p.add_argument("--json-out", default="")
-    args = p.parse_args()
+    args, unknown = p.parse_known_args()
+    if unknown:
+        # Round-3 cell 3a2 passed --num-sessions/--sim-window/
+        # --target-utilization. Seeing them means the notebook on Kaggle is
+        # older than the scripts cell 1 just pulled.
+        print(f"[calibrate] unrecognized arguments: {' '.join(unknown)}")
+        print(STALE_NOTEBOOK)
+        return 5
 
     seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
     cands = [tuple(int(v) for v in c.split("x"))

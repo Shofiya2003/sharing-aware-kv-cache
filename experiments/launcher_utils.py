@@ -88,6 +88,20 @@ def peak_rate() -> float:
     return rate
 
 
+STALE_NOTEBOOK = (
+        "*** Your Kaggle notebook is OUT OF DATE. Cell 1 pulls the latest scripts, "
+        "but the notebook cells are the copy you uploaded. Re-import it: File -> "
+        "Import Notebook -> GitHub URL "
+        "https://github.com/Shofiya2003/sharing-aware-kv-cache/blob/main/notebooks/kaggle_launcher.ipynb "
+        "then Run -> Restart Session and run all cells again.")
+
+
+def arrival_rate() -> float:
+    """Removed in round 4 (load is now peak-paced). Only a notebook older
+    than the scripts calls this."""
+    raise SystemExit(STALE_NOTEBOOK)
+
+
 def estimate_run_s(seed: int) -> float:
     """Wall seconds one run of `seed` should take, from the calibration."""
     per = calibration().get("per_seed", {})
