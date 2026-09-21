@@ -35,6 +35,18 @@ from kvcache.vllm_backend import BackendConfig, VLLMBackend
 from kvcache.workload import WorkloadConfig, generate_workload
 
 
+PEAK_WINDOW_S = 30.0  # = the metrics window
+
+
+def peak_window_prompt_tokens(workload, window_s: float = PEAK_WINDOW_S) -> int:
+    """Prompt tokens submitted in the busiest `window_s` of simulated time."""
+    per = {}
+    for e in workload.events:
+        w = int(e.t // window_s)
+        per[w] = per.get(w, 0) + len(e.prompt_tokens)
+    return max(per.values()) if per else 0
+
+
 async def run_single(
     policy: str,
     capacity: str,
@@ -70,6 +82,20 @@ async def run_single(
         hit_cached_fraction=args.hit_cached_fraction,
         discard_warmup_windows=args.discard_warmup_windows,
         abort_on_backlog_s=args.abort_on_backlog_s,
+        # Half a session's mean idle gap, in wall ms: a queue shorter than
+        # that cannot be what evicted a session's prefix.
+        saturation_floor_ms=0.5 * args.mean_idle_gap_s / args.speed_factor * 1000.0,
+        extra_summary={
+            "run_tag": args.run_tag,
+            "max_num_seqs": args.max_num_seqs,
+            "n_events": len(workload.events),
+            "num_sessions": args.num_sessions,
+            "sim_window_s": args.sim_window,
+            "arrival_rate_req_s": len(workload.events) * args.speed_factor
+                                  / args.sim_window,
+            "speed_factor": args.speed_factor,
+            "target_peak_prompt_tok_s": args.target_peak_prompt_tok_s,
+        },
         output_dir=args.csv_dir,
         run_label=label,
     )
@@ -146,7 +172,21 @@ async def amain(args) -> int:
         f"[run] workload: {len(workload.sessions)} sessions, "
         f"{len(workload.events)} events"
     )
-    if args.target_arrival_rate > 0:
+    if args.target_peak_prompt_tok_s > 0:
+        # Pace by the PEAK 30 s window of prompt-token demand, not the mean.
+        # Contexts grow through a run, so the last windows carry ~2x the
+        # mean demand; a rate set from the average overloads the second
+        # half of every run.
+        if not workload.events:
+            print("[run] workload has no events; cannot derive a speed factor")
+            return 1
+        peak = peak_window_prompt_tokens(workload)
+        args.speed_factor = args.target_peak_prompt_tok_s * PEAK_WINDOW_S / peak
+        print(f"[run] --target-peak-prompt-tok-s {args.target_peak_prompt_tok_s:.0f} "
+              f"(peak window {peak} prompt tokens / {PEAK_WINDOW_S:.0f} sim-s) "
+              f"-> --speed-factor {args.speed_factor:.4f} "
+              f"(~{args.sim_window / args.speed_factor / 60:.1f} min wall per run)")
+    elif args.target_arrival_rate > 0:
         # A speed factor is only meaningful for the workload it was computed
         # on: the same factor over a denser workload is a higher arrival
         # rate. Arm 2 (20 sessions, 300 s) at arm 1's factor (12 sessions,
@@ -216,6 +256,11 @@ def main() -> int:
                         "overrides --speed-factor with the value that gives "
                         "THIS workload that rate. Use the rate from "
                         "experiments/calibrate_load.py.")
+    p.add_argument("--target-peak-prompt-tok-s", type=float, default=0.0,
+                   help="Offered load as prompt tokens per wall second in "
+                        "the workload's busiest 30 s window. Overrides "
+                        "--target-arrival-rate and --speed-factor. Use "
+                        "`peak_prompt_tok_s` from calibrate_load.py.")
     p.add_argument("--sla-latency-ms", type=float, default=2500.0)
     p.add_argument("--hit-latency-threshold-ms", type=float, default=300.0,
                    help="LEGACY latency proxy. Only emits the proxy_hit_rate "
@@ -266,6 +311,12 @@ def main() -> int:
                    help="Submit only each turn's delta instead of the full "
                         "conversation. Reproduces the old (broken) behavior "
                         "where there was no prefix for the cache to reuse.")
+    p.add_argument("--run-tag", default="",
+                   help="Written to the summary CSV's run_tag column. The "
+                        "launcher only counts a summary as done when its tag "
+                        "matches the current round, so a previous round's "
+                        "CSVs (different load, different max_num_seqs) are "
+                        "never mistaken for finished runs.")
     p.add_argument("--csv-dir", default="results/csv")
     p.add_argument("--fig-dir", default="results/figures")
     p.add_argument("--mock", action="store_true", help="Use the mock backend (no GPU).")

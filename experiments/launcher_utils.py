@@ -19,27 +19,81 @@ from typing import Dict, List, Optional
 # run_experiment.py exit codes.
 RC_OVERLOADED = 2      # offered load exceeds capacity: config error, stop
 RC_ENGINE_FAILED = 3   # engine died mid-run: usually transient, retry
+RC_TIMEOUT = 4         # killed by the launcher to stay inside the session
 
 CALIBRATION = "results/load_calibration.json"
 
+# Kaggle kills a GPU session at 9 h wall and, in batch mode, then saves NO
+# output. Round 3 needed 56 h for 24 runs and was cut off at run 5, so every
+# matrix cell now budgets against this clock instead of trusting an estimate.
+SESSION_START_FILE = "/kaggle/working/.kvcache_session_start"
+SESSION_LIMIT_S = 9 * 3600
+# Left for analysis (3c), zip + push (4) and slack in the per-run estimate.
+SESSION_RESERVE_S = 30 * 60
+# Engine start + warmup + drain on top of events / arrival rate.
+RUN_OVERHEAD_S = 150
 
-def arrival_rate() -> float:
-    """The calibrated offered load (req/s) from cell 3a2.
 
-    Refuses to guess. Round 2's guessed load was ~2.8x capacity, and a
-    speed factor alone does not transfer between workloads anyway.
+def mark_session_start() -> float:
+    """Record when this Kaggle session began (cell 1). Idempotent.
+
+    A marker older than the session limit belongs to a previous session
+    (interactive sessions can keep /kaggle/working), so it is replaced.
     """
+    now = time.time()
+    try:
+        t0 = float(open(SESSION_START_FILE).read().strip())
+        if 0 <= now - t0 < SESSION_LIMIT_S:
+            return t0
+    except (OSError, ValueError):
+        pass
+    try:
+        os.makedirs(os.path.dirname(SESSION_START_FILE), exist_ok=True)
+        with open(SESSION_START_FILE, "w") as fh:
+            fh.write(str(now))
+    except OSError:
+        pass  # not on Kaggle; seconds_left() falls back to "now"
+    return now
+
+
+def seconds_left() -> float:
+    """Wall seconds a run may still use before the session reserve."""
+    t0 = mark_session_start()
+    return t0 + SESSION_LIMIT_S - SESSION_RESERVE_S - time.time()
+
+
+def calibration() -> dict:
     if not os.path.exists(CALIBRATION):
         raise SystemExit(f"[launcher] no {CALIBRATION}: run cell 3a2 first.")
-    cal = json.load(open(CALIBRATION))
-    if "arrival_rate_req_s" not in cal:
-        raise SystemExit(f"[launcher] {CALIBRATION} predates arrival-rate "
+    return json.load(open(CALIBRATION))
+
+
+def peak_rate() -> float:
+    """The calibrated offered load from cell 3a2, in prompt tokens/s in the
+    workload's busiest 30 s window (run_experiment --target-peak-prompt-tok-s).
+
+    Refuses to guess. Round 2's guessed load was ~2.8x capacity, and a
+    mean-based rate overloads the end of every run (contexts grow).
+    """
+    cal = calibration()
+    if "peak_prompt_tok_s" not in cal:
+        raise SystemExit(f"[launcher] {CALIBRATION} predates peak-based "
                          f"calibration: re-run cell 3a2.")
-    rate = float(cal["arrival_rate_req_s"])
-    print(f"[launcher] offered load {rate:.3f} req/s "
-          f"({cal.get('target_utilization', '?')} of measured "
-          f"{cal.get('service_rate_req_s', 0):.3f} req/s)")
+    rate = float(cal["peak_prompt_tok_s"])
+    print(f"[launcher] offered load: busiest window at {rate:.0f} prompt tok/s "
+          f"({cal.get('target_peak_utilization', '?')} of measured "
+          f"{cal.get('capacity_prompt_tok_s', 0):.0f} tok/s), "
+          f"max_num_seqs={cal.get('max_num_seqs')}, workload "
+          f"{cal.get('num_sessions')} sessions x {cal.get('sim_window_s')} s")
     return rate
+
+
+def estimate_run_s(seed: int) -> float:
+    """Wall seconds one run of `seed` should take, from the calibration."""
+    per = calibration().get("per_seed", {})
+    if str(seed) in per:
+        return float(per[str(seed)]["est_run_s"])
+    return max((float(v["est_run_s"]) for v in per.values()), default=3600.0)
 
 
 def read_summary(path: str) -> Dict[str, str]:
@@ -67,33 +121,54 @@ def why_unusable(row: Dict[str, str]) -> List[str]:
         err = 0.0
     if err > 0.01:
         why.append(f"engine failed {err:.0%} of requests")
-    if str(row.get("saturated")) == "1":
+    # Only FIFO's saturation says the load is wrong; see metrics.py
+    # saturation_blocks_usable. Older CSVs lack the column: treat as blocking.
+    if (str(row.get("saturated")) == "1"
+            and str(row.get("saturation_blocks_usable", "1")) != "0"):
         why.append("saturated (backlog grew all run)")
     if "usable" not in row:
         why.append("pre-round-3 CSV (no `usable` column)")
     return why
 
 
-def done_labels(csv_dir: str, set_aside_dir: str) -> set:
+def _move_run(csv_dir: str, label: str, dest: str) -> None:
+    os.makedirs(dest, exist_ok=True)
+    for kind in ("summary", "time_series", "per_session"):
+        p = os.path.join(csv_dir, f"{kind}_{label}.csv")
+        if os.path.exists(p):
+            shutil.move(p, os.path.join(dest, os.path.basename(p)))
+
+
+def done_labels(csv_dir: str, set_aside_dir: str, run_tag: str = "",
+                superseded_dir: str = "") -> set:
     """Labels with a USABLE summary. Unusable ones are moved aside.
 
     Anything left in `csv_dir` is treated as finished and never re-run, so
     an unusable summary there would permanently hold its slot in the matrix
     (that is how a run like round 2's `fifo_generous_s2` would survive).
+
+    With `run_tag`, a summary from another round (different run_tag) is
+    moved to `superseded_dir` too: round 3's fifo_constrained ran a 12-
+    session workload at max_num_seqs 8 and would otherwise count as a
+    finished round-4 run.
     """
     done = set()
     moved = []
     for f in sorted(glob.glob(os.path.join(csv_dir, "summary_*.csv"))):
         label = os.path.basename(f)[len("summary_"):-len(".csv")]
-        why = why_unusable(read_summary(f))
+        row = read_summary(f)
+        if run_tag and row.get("run_tag", "") != run_tag:
+            dest = superseded_dir or set_aside_dir
+            _move_run(csv_dir, label, dest)
+            print(f"[launcher] {label}: from run_tag "
+                  f"{row.get('run_tag') or '(none)'!r}, not {run_tag!r} -> "
+                  f"moved to {dest}/")
+            continue
+        why = why_unusable(row)
         if not why:
             done.add(label)
             continue
-        os.makedirs(set_aside_dir, exist_ok=True)
-        for kind in ("summary", "time_series", "per_session"):
-            p = os.path.join(csv_dir, f"{kind}_{label}.csv")
-            if os.path.exists(p):
-                shutil.move(p, os.path.join(set_aside_dir, os.path.basename(p)))
+        _move_run(csv_dir, label, set_aside_dir)
         moved.append((label, "; ".join(why)))
     for label, why in moved:
         print(f"[launcher] {label}: not usable ({why}) -> moved to "
@@ -102,12 +177,15 @@ def done_labels(csv_dir: str, set_aside_dir: str) -> set:
 
 
 def gpu_used_mib() -> Optional[int]:
-    r = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-        capture_output=True, text=True)
-    if r.returncode != 0 or not r.stdout.strip():
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        return max(int(x) for x in r.stdout.split())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
-    return max(int(x) for x in r.stdout.split())
 
 
 def wait_for_gpu_free(limit_mib: int = 1024, timeout_s: float = 180.0) -> None:
@@ -130,13 +208,49 @@ def wait_for_gpu_free(limit_mib: int = 1024, timeout_s: float = 180.0) -> None:
         print(f"[launcher] GPU free after {time.monotonic() - t0:.0f}s")
 
 
-def run(cmd: List[str], env: Dict[str, str], label: str) -> int:
-    """Run one experiment; retry once if the engine died. Returns the rc."""
+def _run_with_deadline(cmd: List[str], env: Dict[str, str],
+                       timeout_s: Optional[float]) -> int:
+    """subprocess.run, but a timeout kills the whole process group.
+
+    The vLLM engine core is a grandchild; killing only the direct child
+    would leave it holding the GPU for the next run.
+    """
+    proc = subprocess.Popen(cmd, env=env, text=True, start_new_session=True)
+    try:
+        return proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        import signal
+        for sig, grace in ((signal.SIGTERM, 20), (signal.SIGKILL, 10)):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                break
+            try:
+                proc.wait(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        return RC_TIMEOUT
+
+
+def run(cmd: List[str], env: Dict[str, str], label: str,
+        deadline_s: Optional[float] = None) -> int:
+    """Run one experiment; retry once if the engine died. Returns the rc.
+
+    `deadline_s` is a time.monotonic() value the run must not outlive; it
+    is killed (RC_TIMEOUT) rather than letting Kaggle kill the notebook.
+    """
     for attempt in (1, 2):
         wait_for_gpu_free()
-        r = subprocess.run([sys.executable] + cmd, env=env, text=True)
-        if r.returncode != RC_ENGINE_FAILED or attempt == 2:
-            return r.returncode
+        timeout = None if deadline_s is None else deadline_s - time.monotonic()
+        if timeout is not None and timeout <= 0:
+            return RC_TIMEOUT
+        rc = _run_with_deadline([sys.executable] + cmd, env, timeout)
+        if rc == RC_TIMEOUT:
+            print(f"[launcher] {label}: killed at the session deadline")
+            return rc
+        if rc != RC_ENGINE_FAILED or attempt == 2:
+            return rc
         print(f"[launcher] {label}: engine failed mid-run; retrying once "
               f"on a fresh engine")
-    return r.returncode
+    return rc

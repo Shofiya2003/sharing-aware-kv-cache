@@ -134,6 +134,14 @@ class BenchConfig:
     # the first run loudly is cheaper than discovering it in the CSVs.
     abort_on_backlog_s: float = 0.0
 
+    # Extra columns copied into the summary CSV verbatim: the run tag and
+    # the load/concurrency settings that make runs from different rounds
+    # incomparable. Lets the launcher tell a stale round's CSV from a
+    # finished run of the current one.
+    extra_summary: Dict[str, object] = field(default_factory=dict)
+    # See MetricsConfig.saturation_floor_ms.
+    saturation_floor_ms: float = 0.0
+
 
 def make_policy(name: str, alpha: float = 0.5) -> DispatchPolicy:
     if name == "fifo":
@@ -297,6 +305,8 @@ async def run_benchmark(
             output_dir=cfg.output_dir,
             run_label=cfg.run_label,
             discard_warmup_windows=cfg.discard_warmup_windows,
+            saturation_floor_ms=cfg.saturation_floor_ms,
+            saturation_blocks_usable=(cfg.policy_name == "fifo"),
         )
     )
 
@@ -399,7 +409,11 @@ async def run_benchmark(
             # oldest entry's wall-clock wait is the clearest signal that
             # offered load has outrun the engine. Checked before scoring so
             # an unrecoverable run dies in minutes, not in twenty.
-            if cfg.abort_on_backlog_s > 0 and queue:
+            # FIFO only: FIFO's oldest request is a pure load signal. A
+            # reordering policy's oldest request can be one it is starving
+            # on purpose; aborting that run (and with it the matrix) would
+            # punish the policy's behaviour as if it were an overload.
+            if cfg.abort_on_backlog_s > 0 and queue and cfg.policy_name == "fifo":
                 oldest_arrival_wall = sim_start_wall + min(
                     q.arrival_t for q in queue) / speed
                 backlog_s = time.monotonic() - oldest_arrival_wall
@@ -520,6 +534,7 @@ async def run_benchmark(
         summary["engine_prefix_cache_hit_rate"] = (
             float(engine_hr) if engine_hr is not None else -1.0
         )
+        summary.update(cfg.extra_summary)
         basis = summary.get("hit_basis", "?")
         cov = summary.get("cache_ground_truth_coverage", 0.0)
         print(f"[bench:{cfg.run_label}] hit_basis={basis} "

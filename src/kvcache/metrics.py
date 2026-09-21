@@ -83,6 +83,19 @@ class MetricsConfig:
     # nothing is hidden -- they are just not allowed to set the headline
     # P99, which is how run order came to dominate the first results.
     discard_warmup_windows: int = 1
+    # A run is only `saturated` if its final-window median dispatch wait also
+    # exceeds this (wall ms). The launcher sets it to half a session's mean
+    # idle gap in wall time: past that, requests are served after their
+    # session would normally have moved on, so their prefix may be evicted
+    # -- which is the actual harm. 0 keeps the old test.
+    saturation_floor_ms: float = 0.0
+    # Whether `saturated` makes the run unusable. True only for FIFO: the
+    # FIFO run of each seed certifies that the LOAD is servable. A
+    # reordering policy can then build a long wait for itself by starving
+    # low-priority requests (none of them age), which is an outcome of that
+    # policy -- visible in its e2e/queue-wait tail -- not a broken run.
+    # Excluding it would drop exactly the policies under test.
+    saturation_blocks_usable: bool = True
 
 
 def percentile(xs: Sequence[float], pct: float) -> float:
@@ -185,9 +198,16 @@ class MetricsLogger:
         the hit rate decays with the backlog. We compare the first and
         last non-warmup windows that actually carry requests.
 
-        `saturated` requires BOTH a large growth ratio and an absolute
-        wait that is itself meaningful, so a run that merely rises from
-        20 ms to 80 ms is not flagged.
+        `saturated` requires a large growth ratio AND an absolute wait that
+        is itself meaningful, so a run that merely rises from 20 ms to
+        80 ms is not flagged.
+
+        Growth is measured against at least 1 s. With few engine slots the
+        first steady window often has a median wait of exactly 0, which
+        made the ratio infinite and flagged any run whose end-heavy last
+        window queued for >10 s -- even when the backlog drained and no
+        request waited anywhere near a session's idle gap. Round 2's
+        runaway (32 s -> 545 s) is still flagged either way.
         """
         wins = sorted(w for w in self._win_states if w >= warm_w
                       and self._win_states[w]["lookups"] > 0)
@@ -196,10 +216,10 @@ class MetricsLogger:
                     "saturated": False}
         first = percentile(self._win_states[wins[0]]["queue_waits"], 0.50)
         last = percentile(self._win_states[wins[-1]]["queue_waits"], 0.50)
-        growth = (last / first) if first > 0 else float("inf") if last > 0 else 0.0
-        saturated = bool(last > self.cfg.sla_latency_ms * 4 and growth > 2.0)
-        return {"first_ms": first, "last_ms": last,
-                "growth": (0.0 if growth == float("inf") else growth),
+        growth = last / max(first, 1000.0)
+        saturated = bool(last > self.cfg.sla_latency_ms * 4 and growth > 2.0
+                         and last > self.cfg.saturation_floor_ms)
+        return {"first_ms": first, "last_ms": last, "growth": growth,
                 "saturated": saturated}
 
     def _new_win_state(self) -> Dict:
@@ -395,6 +415,7 @@ class MetricsLogger:
                 "p50_latency_ms": 0.0, "p99_latency_ms": 0.0,
                 "p50_e2e_latency_ms": 0.0, "p99_e2e_latency_ms": 0.0,
                 "p50_queue_wait_ms": 0.0, "p99_queue_wait_ms": 0.0,
+                "dispatch_queued_fraction": 0.0,
                 "goodput": 0.0, "proxy_hit_rate": 0.0,
                 "n_records_all": n_all, "n_warmup_windows_discarded": warm_w,
                 "context_truncated_rate": 0.0,
@@ -445,6 +466,11 @@ class MetricsLogger:
                 "p99_e2e_latency_ms": percentile(e2e, 0.99),
                 "p50_queue_wait_ms": percentile(qw, 0.50),
                 "p99_queue_wait_ms": percentile(qw, 0.99),
+                # Share of requests that waited in OUR dispatch queue, i.e.
+                # the only requests a policy could reorder. Round 3 had
+                # ~14%, 1-2 deep: every policy dispatched the same order.
+                # (250 ms is well above the 50 ms dispatch-loop tick.)
+                "dispatch_queued_fraction": sum(1 for w in qw if w > 250.0) / n,
                 "goodput": good / n,
                 # What the discredited latency threshold would have reported,
                 # on the same requests. Published side by side on purpose.
@@ -481,8 +507,9 @@ class MetricsLogger:
                     basis == "cached_tokens"
                     and coverage >= 0.99
                     and error_rate <= 0.01
-                    and not sat["saturated"]
+                    and not (sat["saturated"] and self.cfg.saturation_blocks_usable)
                 ),
+                "saturation_blocks_usable": int(self.cfg.saturation_blocks_usable),
             }
         summary_path = os.path.join(self.cfg.output_dir, f"summary_{self.cfg.run_label}.csv")
         pd.DataFrame([summary]).to_csv(summary_path, index=False)
