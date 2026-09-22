@@ -756,3 +756,43 @@ class TestCacheSim(unittest.TestCase):
         ev = self._events()
         rates = [simulate(ev, c, "lru").cached_token_rate for c in (20, 60, 200, 2000)]
         self.assertEqual(rates, sorted(rates))
+
+
+class TestReusePredictor(unittest.TestCase):
+    """src/kvcache/predictor.py: learned from past conversations only."""
+
+    @staticmethod
+    def _conv(times, users=None):
+        from kvcache.wildchat import Conversation
+        c = Conversation(conv_id=str(times), start=0.0, turn_times=list(times),
+                         user_text=[""] * len(times), reply_text=[""] * len(times))
+        if users is not None:
+            c.user_tokens = [tuple(range(n)) for n in users]
+        return c
+
+    def test_end_probability_and_gaps(self):
+        from kvcache.predictor import ReturnModel
+        # Two single-turn conversations end; one continues after 10 s.
+        m = ReturnModel.fit([self._conv([0.0]), self._conv([0.0]), self._conv([0.0, 10.0])])
+        self.assertAlmostEqual(m.p_end[0], 2 / 3)
+        self.assertEqual(m.gaps[0], [10.0])
+
+    def test_idle_time_lowers_return_probability(self):
+        from kvcache.predictor import ReturnModel
+        # Gaps of 10 s and 1000 s: after 60 s idle only the slow one remains.
+        m = ReturnModel.fit([self._conv([0.0, 10.0]), self._conv([0.0, 1000.0])])
+        self.assertAlmostEqual(m.p_return_within(1, 0.0, 60.0), 0.5)
+        self.assertAlmostEqual(m.p_return_within(1, 60.0, 60.0), 0.0)
+        self.assertAlmostEqual(m.p_return_within(1, 60.0, 1000.0), 1.0)
+
+    def test_conversations_that_always_end_never_return(self):
+        from kvcache.predictor import ReturnModel
+        m = ReturnModel.fit([self._conv([0.0])] * 5)
+        self.assertEqual(m.p_return_within(1, 0.0, 1e9), 0.0)
+
+    def test_fit_probability(self):
+        from kvcache.predictor import FitModel
+        f = FitModel.fit([self._conv([0.0, 1.0, 2.0], users=[5, 100, 300])], max_context=1000)
+        self.assertEqual(f.p_fits(500), 1.0)      # room 500: both follow-ups fit
+        self.assertEqual(f.p_fits(800), 0.5)      # room 200: only the 100-token one
+        self.assertEqual(f.p_fits(1000), 0.0)     # no room
