@@ -205,15 +205,26 @@ Budget 3,004 blocks (≈ T4 constrained), mean over seeds 0–4.
 - The truncation-off workload exceeds the model's real context limit; it is a
   diagnostic for finding 3, not a deployable setting.
 
+## Real traffic: WildChat (2026-09-22)
+
+The same model replayed on real ChatGPT conversations (WildChat) instead of
+the synthetic generator, with replies cached as well as prompts, and a
+**learned** reuse predictor. Full design and results: [PREDICTOR.md](PREDICTOR.md).
+
+At the T4 budget, the oracle beats LRU by 16–38 points (vs 4 synthetic),
+evicting by true return time closes 92–97% of that gap, and the learned
+predictor beats LRU in every setting (36/36 seed-runs), closing 10–20% of
+it. This supersedes finding 4 below: with real, heavy-tailed gaps, idle
+time is informative and prediction helps.
+
 ## Next steps
 
+- [x] **Learned reuse predictor on real traffic** (WildChat): done, see PREDICTOR.md.
 - [ ] **Block-value predictor:** evict by P(return soon) × P(block survives into
       the next prompt). The second factor is largely computable: a session near
       the context cap will lose its middle turns next, while its pinned
       preamble stays valid. Target: close the oracle gap *with* truncation on.
-- [ ] **Realistic sessions:** heavy-tailed idle gaps and sessions that end, so a
-      history-based predictor has real signal. Then measure how close a
-      realistic predictor gets to `perfect-return`.
-- [ ] **Popularity baseline (LFU)** for comparison.
+- [x] **Realistic sessions:** replaced by real WildChat conversations.
+- [x] **Popularity baseline (LFU)**, plus an adaptation of Preble's windowed-use cost.
 - [ ] Later: a service-time model (latency, p99, throughput), a real
       conversation trace, and multi-GPU routing.

@@ -796,3 +796,38 @@ class TestReusePredictor(unittest.TestCase):
         self.assertEqual(f.p_fits(500), 1.0)      # room 500: both follow-ups fit
         self.assertEqual(f.p_fits(800), 0.5)      # room 200: only the 100-token one
         self.assertEqual(f.p_fits(1000), 0.0)     # no room
+
+
+class TestCacheSimWildChatPolicies(unittest.TestCase):
+    """Reply caching and the lfu / preble-cost / reuse policies."""
+
+    def test_reply_blocks_are_cached_for_the_next_turn(self):
+        from kvcache.cachesim import simulate
+        from kvcache.workload import TurnEvent
+        p1 = tuple(range(2 * BLOCK_SIZE))
+        reply = tuple(range(500, 500 + 2 * BLOCK_SIZE))
+        p2 = p1 + reply + tuple(range(900, 900 + BLOCK_SIZE))
+        ev = [TurnEvent("a", 0, 0.0, p1, "user", True, p1, output_tokens=reply),
+              TurnEvent("a", 1, 5.0, p2, "user", True, p2)]
+        # Turn 2 reuses turn 1's prompt AND reply: 4 blocks.
+        self.assertEqual(simulate(ev, None).cached_tokens, 4 * BLOCK_SIZE)
+
+    def test_new_policies_are_bounded(self):
+        from kvcache.cachesim import ALL_POLICIES, simulate
+        from kvcache.predictor import FitModel, ReturnModel, ReusePredictor
+        from kvcache.wildchat import Conversation
+        ev = TestCacheSim._events()
+        # A predictor fitted on a toy history is enough to exercise the policy.
+        hist = [Conversation("h", 0.0, [0.0, 20.0, 50.0], [""] * 3, [""] * 3,
+                             user_tokens=[(1,) * 30] * 3, reply_tokens=[()] * 3)]
+        pred = ReusePredictor(ReturnModel.fit(hist), FitModel.fit(hist, 4096))
+        ceil = simulate(ev, None).cached_token_rate
+        r = {p: simulate(ev, 60, p, predictor=pred).cached_token_rate for p in ALL_POLICIES}
+        for p, v in r.items():
+            self.assertLessEqual(v, ceil + 1e-12, p)
+            self.assertGreaterEqual(r["oracle"] + 1e-12, v, p)
+
+    def test_reuse_needs_a_predictor(self):
+        from kvcache.cachesim import simulate
+        with self.assertRaises(ValueError):
+            simulate(TestCacheSim._events(), 60, "reuse")

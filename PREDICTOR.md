@@ -124,8 +124,8 @@ budgets.
 | 2026-09-21 | WildChat loader (`src/kvcache/wildchat.py`), time-based train/test split | done, commit `584a649` |
 | 2026-09-21 | Predictor model (`src/kvcache/predictor.py`) and fit script (`experiments/predictor_fit.py`) | done |
 | 2026-09-21 | Standalone check on the test days | done: calibrated, AUC 0.786 (results below) |
-| | Eviction policies in the simulator (`reuse`, `lfu`, `preble-cost`) | |
-| | Evaluation sweep over load and memory; results table | |
+| 2026-09-21 | Eviction policies in the simulator (`reuse`, `lfu`, `preble-cost`); replies cached | done |
+| 2026-09-22 | Evaluation sweep over load and memory (`experiments/wildchat_eviction.py`) | done: results below |
 
 ---
 
@@ -181,3 +181,62 @@ probabilities, not just as a ranking.
 **P(next prompt still fits 4,096 tokens)**: 0.999 at 1,000 tokens, 0.993 at
 3,000, 0.949 at 3,900, 0 once full. Follow-up messages are short, so this
 term only matters for conversations near the limit, as expected.
+
+### Eviction on real WildChat traffic (2026-09-22)
+
+`PYTHONPATH=src python experiments/wildchat_eviction.py` (about 18 minutes;
+CSV in `results/wildchat/eviction.csv`). Predictor fitted on the training
+days; 3 seeds, each a separate slice of 2,000 test conversations
+(5,500–6,200 requests); loads of 5–40 new conversations per minute; KV
+budgets of 1,000, 3,004 (≈ the T4 at `gpu_memory_utilization=0.3`) and
+6,000 blocks; context limit 4,096; the first 10 minutes excluded.
+
+**Cached-token rate at the T4 budget (3,004 blocks)**, mean of 3 seeds:
+
+| Load (new conv/min) | LRU | Reuse predictor | Perfect return | Oracle | Infinite |
+|---|---|---|---|---|---|
+| 5 | 0.671 | 0.688 | 0.818 | 0.831 | 0.876 |
+| 10 | 0.547 | 0.575 | 0.773 | 0.786 | 0.877 |
+| 20 | 0.369 | 0.436 | 0.708 | 0.719 | 0.881 |
+| 40 | 0.257 | 0.321 | 0.625 | 0.638 | 0.886 |
+
+**Share of the LRU → oracle gap each policy closes**, all 12 settings
+(range across settings; paired by seed):
+
+| Policy | Gap closed | Settings above LRU |
+|---|---|---|
+| `reuse` (learned predictor) | **+10% to +20%** | **12/12 (36/36 seed-runs)** |
+| `perfect-return` (true return times) | +92% to +97% | 12/12 |
+| `preble-cost` (Preble's windowed-use cost, adapted) | 0% to +8% | 7/12 |
+| `predictive` (hand-written heuristic) | −170% to 0% | 0/12 |
+| `lfu` | −575% to −17% | 0/12 |
+
+**Prefill work saved** (recomputed prompt tokens, relative to LRU): the
+reuse predictor saves **4–11%**; perfect return-time knowledge would save
+27–57%; the oracle 28–59%.
+
+**What this shows**
+
+1. **On real traffic, when a conversation returns is almost the whole
+   story.** Evicting by true return time closes 92–97% of the gap to the
+   oracle in every setting. Truncation, which broke this in the synthetic
+   study, is rare at 4,096 tokens (0.6% of requests).
+2. **The learned predictor beats LRU everywhere,** in all 36 seed-runs, by
+   up to 6.8 points of cached tokens (20 conv/min at the T4 budget: 0.369 →
+   0.436, 10.6% less prefill).
+3. **But it recovers only 10–20% of what perfect return prediction would.**
+   The eviction rule is right (perfect-return proves it); the bottleneck is
+   prediction accuracy. Its AUC is 0.786 using only turn count and idle
+   time.
+4. **Frequency is the wrong signal.** LFU is far worse than LRU: blocks of
+   long-finished conversations keep their high counts and clog the cache.
+   Preble's windowed-use cost avoids that with its 3-minute window and
+   roughly matches LRU (up to +8% of the gap), which fits its purpose: it
+   was designed to balance load across GPUs, not to rank evictions.
+5. **The earlier hand-written heuristic is worse than LRU** in every
+   setting: plausible-looking prediction without data is harmful.
+
+**Next:** improve return prediction with more signals available at serving
+time (the user's history via `hashed_ip`, message and reply length, whether
+the reply ended with a question, time of day), and measure how much of the
+remaining gap to `perfect-return` each closes.
