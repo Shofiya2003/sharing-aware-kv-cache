@@ -240,3 +240,21 @@ reuse predictor saves **4–11%**; perfect return-time knowledge would save
 time (the user's history via `hashed_ip`, message and reply length, whether
 the reply ended with a question, time of day), and measure how much of the
 remaining gap to `perfect-return` each closes.
+
+### Reproduction and scope (2026-09-23)
+
+Re-ran both checks. `predictor_fit.py` gives the same AUC (0.786) and Brier
+score (0.1597 vs 0.1986). `wildchat_eviction.py`, after moving the predictor
+fit and the sweep into `fit_predictor()` and `sweep()`, reproduces
+`results/wildchat/eviction.csv` exactly (264 rows, maximum difference 0.0).
+
+What these results do and do not support:
+
+- Supported: on WildChat, replayed in arrival order in the simulator, the
+  learned predictor beats LRU in all 36 seed-runs; the predictor is fitted on
+  earlier days and evaluated on later ones.
+- Not yet shown: other datasets (the tables are fitted to WildChat's gap
+  distribution), Preble's real scheduler and eviction path (the simulator has
+  no queue reordering or GPU routing), and latency or throughput.
+- `perfect-return` uses future arrival times, so it is a ceiling for return
+  prediction, not something a deployed predictor can reach.

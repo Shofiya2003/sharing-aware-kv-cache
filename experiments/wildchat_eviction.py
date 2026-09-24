@@ -37,6 +37,44 @@ def ints(s):
     return [int(x) for x in s.split(",") if x]
 
 
+def fit_predictor(train, tok, max_context, sample_size=5000):
+    """Fit the reuse predictor on the training days (see PREDICTOR.md)."""
+    sample = train[:: max(1, len(train) // sample_size)]
+    tokenize(sample, tok)
+    return ReusePredictor(ReturnModel.fit(train), FitModel.fit(sample, max_context))
+
+
+def sweep(test, system, tok, predictor, rates, caps, seeds, replay=2000,
+          max_context=4096, warmup_s=600.0, verbose=True):
+    """Replay held-out conversations under every policy. Returns CSV-ready rows.
+
+    Each seed is a different, non-overlapping slice of test conversations.
+    """
+    rows = []
+    for seed in seeds:
+        block = test[seed * replay:(seed + 1) * replay]
+        if len(block) < replay:
+            if verbose:
+                print(f"seed {seed}: only {len(block)} test conversations left; stopping")
+            break
+        tokenize(block, tok)
+        for rate in rates:
+            events = build_workload(block, system, rate, max_context, seed=seed)
+            t0 = time.time()
+            runs = [(None, "infinite")] + [(c, p) for c in caps for p in ALL_POLICIES]
+            for cap, pol in runs:
+                r = simulate(events, cap, pol, warmup_s=warmup_s, predictor=predictor)
+                rows.append(dict(rate_per_min=rate, capacity_blocks=cap or "inf", seed=seed,
+                                 policy=r.policy, cached_token_rate=round(r.cached_token_rate, 6),
+                                 recomputed_tokens=r.recomputed_tokens,
+                                 prompt_tokens=r.prompt_tokens, n_requests=r.n_requests,
+                                 evictions=r.evictions))
+            if verbose:
+                print(f"seed {seed} rate {rate:g}/min: {len(events)} requests, "
+                      f"{len(runs)} runs in {time.time() - t0:.0f}s", flush=True)
+    return rows
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shard", default=DEFAULT_SHARD)
@@ -55,32 +93,10 @@ def main() -> int:
     convs, _ = read_conversations(a.shard)
     train, test = split_by_time(convs, 0.6)
     tok = load_tokenizer()
-    system = system_tokens(tok)
-    length_sample = train[:: max(1, len(train) // 5000)]
-    tokenize(length_sample, tok)
-    predictor = ReusePredictor(ReturnModel.fit(train), FitModel.fit(length_sample, a.max_context))
+    predictor = fit_predictor(train, tok, a.max_context)
     print(f"predictor fitted on {len(train)} training conversations", flush=True)
-
-    rows = []
-    for seed in seeds:
-        replay = test[seed * a.replay:(seed + 1) * a.replay]
-        if len(replay) < a.replay:
-            print(f"seed {seed}: only {len(replay)} test conversations left; stopping")
-            break
-        tokenize(replay, tok)
-        for rate in rates:
-            events = build_workload(replay, system, rate, a.max_context, seed=seed)
-            t0 = time.time()
-            runs = [(None, "infinite")] + [(c, p) for c in caps for p in ALL_POLICIES]
-            for cap, pol in runs:
-                r = simulate(events, cap, pol, warmup_s=a.warmup_s, predictor=predictor)
-                rows.append(dict(rate_per_min=rate, capacity_blocks=cap or "inf", seed=seed,
-                                 policy=r.policy, cached_token_rate=round(r.cached_token_rate, 6),
-                                 recomputed_tokens=r.recomputed_tokens,
-                                 prompt_tokens=r.prompt_tokens, n_requests=r.n_requests,
-                                 evictions=r.evictions))
-            print(f"seed {seed} rate {rate:g}/min: {len(events)} requests, "
-                  f"{len(runs)} runs in {time.time() - t0:.0f}s", flush=True)
+    rows = sweep(test, system_tokens(tok), tok, predictor, rates, caps, seeds,
+                 a.replay, a.max_context, a.warmup_s)
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w", newline="") as fh:
