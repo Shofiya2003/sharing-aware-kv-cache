@@ -258,3 +258,51 @@ What these results do and do not support:
   no queue reordering or GPU routing), and latency or throughput.
 - `perfect-return` uses future arrival times, so it is a ceiling for return
   prediction, not something a deployed predictor can reach.
+
+### Inside Preble's real radix cache (2026-09-24)
+
+`PYTHONPATH=src python experiments/preble_radix_eval.py --preble ~/development/preble`
+(about 10 minutes, CSV in `results/preble/radix_eval.csv`).
+
+**Method.** Preble's own `RadixCache` (`python/sglang/srt/managers/router/radix_cache.py`)
+is loaded unmodified by file path and driven with the same WildChat events as
+`cachesim`, on a virtual clock (Preble stamps nodes with `time.time()`). Its
+tree, prefix matching, node splitting and `inc_lock_ref` pinning are used as
+is. Preble's local eviction is LRU: `evict()` pops leaves from a min-heap
+ordered by `last_access_time`, skipping pinned nodes. The predictor arm is a
+subclass that overrides only `evict()`: same loop, but the heap key is
+`1 - prod(1 - value_s)` over the conversations owning the leaf (ties by last
+access time), using the same `session_value` and horizon H as the simulator.
+Preble's repository is not modified.
+
+Differences from the block simulator, all Preble's behaviour: capacity in
+tokens (budget x 16), whole leaves evicted at a time (partial eviction off),
+and the running request pins its matched prefix while room is made.
+
+**Cached-token rate**, mean of 3 seeds (each a separate slice of 2,000 test
+conversations; first 10 minutes excluded):
+
+| Load (new conv/min) | Blocks | Preble LRU | Preble + predictor | Gain | Simulator gain |
+|---|---|---|---|---|---|
+| 10 | 1,000 | 0.202 | 0.266 | +0.064 | +0.068 |
+| 10 | 3,004 | 0.553 | 0.584 | +0.031 | +0.028 |
+| 10 | 6,000 | 0.714 | 0.728 | +0.014 | +0.014 |
+| 20 | 1,000 | 0.144 | 0.193 | +0.049 | +0.060 |
+| 20 | 3,004 | 0.375 | 0.438 | +0.063 | +0.067 |
+| 20 | 6,000 | 0.615 | 0.641 | +0.026 | +0.025 |
+| 40 | 1,000 | 0.135 | 0.158 | +0.023 | +0.034 |
+| 40 | 3,004 | 0.263 | 0.321 | +0.058 | +0.065 |
+| 40 | 6,000 | 0.474 | 0.529 | +0.055 | +0.054 |
+
+**What this shows.** The predictor beats Preble's LRU in all 27 seed-runs
+(minimum gain +0.010), and its gain tracks the simulator's. Preble's LRU
+matches the simulator's LRU to within 0.011 everywhere, which supports the
+simulator's model of the cache.
+
+**Limits.** Requests are served in arrival order: no Preble scheduler,
+router, priority queue or GPU, and no latency or throughput measurement. The
+result is that the predictor works inside Preble's real eviction path, not
+that Preble with it is faster end to end. WildChat only. Preble's own
+benchmarks (ToolBench, LooGLE, video QA, APPS) are mostly independent
+requests over shared prefixes with generated arrival times, so the idle-time
+signal this predictor relies on would be absent there.
