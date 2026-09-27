@@ -132,9 +132,16 @@ def simulate(events: Sequence, capacity_blocks: Optional[int], policy: str = "lr
             raise ValueError("policy 'reuse' needs predictor=ReusePredictor(...)")
     evs = sorted(events, key=lambda e: e.t)
     # Hashes of prompt + reply; the prompt's own blocks are a prefix of these.
-    hashes = [block_hashes(tuple(e.prompt_tokens) + tuple(getattr(e, "output_tokens", ())),
-                           block_size) for e in evs]
-    n_prompt_blocks = [len(e.prompt_tokens) // block_size for e in evs]
+    # Events from a hashed trace (`bailian.py`) carry `block_ids`, `prompt_len`
+    # and `output_len` instead of tokens; everything else is tokenized.
+    hashed = [getattr(e, "block_ids", None) is not None for e in evs]
+    prompt_len = [e.prompt_len if h else len(e.prompt_tokens) for e, h in zip(evs, hashed)]
+    output_len = [e.output_len if h else len(getattr(e, "output_tokens", ()))
+                  for e, h in zip(evs, hashed)]
+    hashes = [list(e.block_ids) if h else
+              block_hashes(tuple(e.prompt_tokens) + tuple(getattr(e, "output_tokens", ())),
+                           block_size) for e, h in zip(evs, hashed)]
+    n_prompt_blocks = [n // block_size for n in prompt_len]
 
     # Future knowledge, used ONLY by the oracle / perfect-return policies.
     # A block counts as "used" by a later request only if it is in that
@@ -156,7 +163,7 @@ def simulate(events: Sequence, capacity_blocks: Optional[int], policy: str = "lr
     for i, (ev, hs) in enumerate(zip(evs, hashes)):
         now = ev.t
         step = i + 1
-        n_tok = len(ev.prompt_tokens)
+        n_tok = prompt_len[i]
 
         # 1. Longest resident prefix of the PROMPT, leaving >= 1 token to recompute.
         matched = 0
@@ -197,8 +204,7 @@ def simulate(events: Sequence, capacity_blocks: Optional[int], policy: str = "lr
             b.uses += 1
             b.recent.append(now)
         live.observe(ev.session_id, ev.turn_index, ev.t, ev.tokens, ev.role)
-        state[ev.session_id] = (ev.turn_index + 1, now,
-                                n_tok + len(getattr(ev, "output_tokens", ())))
+        state[ev.session_id] = (ev.turn_index + 1, now, n_tok + output_len[i])
 
     return SimResult(policy if capacity_blocks is not None else "infinite",
                      capacity_blocks, n_req, prompt_tok, cached_tok, evictions)

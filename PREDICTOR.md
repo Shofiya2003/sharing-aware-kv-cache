@@ -1,172 +1,200 @@
 # Reuse predictor for KV-cache eviction
 
-A running record of what the predictor is, why it is built this way, and
-what has been implemented and measured. Companion to
-[CACHE_SIMULATION.md](CACHE_SIMULATION.md), which covers the simulator it is
-evaluated in.
+Replace LRU eviction with a learned estimate of *which cached conversation
+is most likely to be used again*. This file is the report: what was tried, in
+what order, what changes in Preble, how to reproduce every number, and the
+results, including the one that did not work out well.
+
+Related files:
+
+- [PROBABILITY_GUIDE.md](PROBABILITY_GUIDE.md): how the probabilities are
+  calculated, from scratch.
+- [CACHE_SIMULATION.md](CACHE_SIMULATION.md): the simulator and the synthetic
+  study that motivated this.
+
+## Summary
+
+- **Idea.** When the cache is full, evict the leaf with the lowest
+  `value = P(conversation returns within H | idle time, turns so far) × P(its next prompt still fits)`, instead of the least recently used one.
+- **Quality.** On held-out WildChat data the return probability is calibrated
+  (Brier 0.160 vs 0.199 for a constant rate, AUC 0.786). On a second real
+  trace (Qwen-Bailian) it is equally good (AUC 0.784), and WildChat's tables
+  applied unchanged reach 0.783.
+- **Eviction, WildChat.** Beats LRU in all 36 simulator seed-runs and all 27
+  seed-runs inside Preble's real radix cache; closes 10–20% of the gap
+  between LRU and the oracle. Knowing true return times would close 92–97%,
+  so the eviction rule is right and prediction accuracy is the limit.
+- **Eviction, Bailian.** Weak: +0.3% to +11% of the gap, ahead of LRU in
+  7 of 9 runs, and the WildChat tables do not help there. Causes untested.
+- **Not shown.** Any effect with Preble's scheduler or router, on a GPU, or
+  on latency and throughput. Requests are replayed in arrival order.
 
 ---
 
-## Goal
+## Phases, in the order we did them
 
-When the KV cache is full, evict the cached tokens **least likely to be
-reused**, instead of the least recently used ones (LRU, what vLLM and SGLang
-do). The simulator showed the prize: an oracle that knows the future beats
-LRU by about 4 points of cached tokens at a T4-sized budget.
-
-## What must be predicted, and why
-
-Cached tokens belong to a conversation. They are reused only if **both**:
-
-1. **the conversation returns** before the cache would have dropped them
-   anyway, and
-2. **its next prompt still starts with them**. If the conversation has grown
-   past the context limit, the next prompt drops old turns, its opening
-   changes, and none of its cached tokens match any more.
-
-So the value of keeping a conversation's cache is
-
-```
-value = P(returns within H | idle so far, turns so far)  ×  P(next prompt still fits)
-```
-
-where **H** is how long the cache currently keeps things (see below).
-
-Why both terms: in the synthetic study, perfect knowledge of return times
-matched the oracle when nothing was truncated, but did *worse* than LRU when
-37% of requests were truncated (CACHE_SIMULATION.md, finding 3). On WildChat
-at a 4,096-token limit only 0.6% of requests are truncated, so the first
-term should do most of the work; the second keeps the policy correct when
-contexts are long.
-
-## Term 1: will the conversation return, and soon?
-
-Learned from the **training days** of WildChat only.
-
-For every training conversation and every turn *k*, record what happened
-next: either the gap until turn *k+1*, or **END** (no further turn). Group
-by how many turns the conversation has had so far (1, 2, 3, 4–5, 6–9, 10+),
-because conversations that have already continued are more likely to
-continue again.
-
-For a group, with `p_end` = the fraction that ended and `ECDF` = the
-distribution of observed gaps:
-
-```
-F(x) = (1 − p_end) · ECDF(x)        probability of returning within x seconds
-
-P(return within H | idle for a) = (F(a + H) − F(a)) / (1 − F(a))
-```
-
-The division is what makes idle time informative: once a user has been
-silent for `a` seconds, only outcomes later than `a` are still possible.
-With heavy-tailed gaps (WildChat's coefficient of variation is ~8), this
-probability falls the longer a user stays idle. With the memoryless gaps of
-the synthetic generator it would not change at all, which is why the
-earlier history-based predictor learned nothing.
-
-## Term 2: will the next prompt still fit?
-
-The next prompt = the conversation so far (last prompt + reply, already
-cached) + the user's next message. It fits if
-
-```
-current_length + next_message_length ≤ max_context
-```
-
-`next_message_length` is unknown, so use the distribution of follow-up
-message lengths from the training days:
-
-```
-P(fits) = ECDF_followup_length(max_context − current_length)
-```
-
-## The horizon H
-
-"Returns soon" only matters relative to how long the cache holds things.
-H = the age of the least recently used block currently cached: the time
-LRU would keep an idle conversation. It adapts automatically: under heavy
-load H is short, so only conversations likely to return very soon are
-worth protecting.
-
-## How it becomes an eviction policy
-
-Each cached block belongs to one or more conversations. Its value is
-`1 − Π(1 − value_s)` over those conversations (a system prompt shared by
-everyone is therefore always kept). Evict the lowest-value blocks first;
-within one conversation, the deepest blocks first (they are useless
-without the blocks before them); ties broken by LRU.
-
-The predictor sees only the past: turns already served, their times and
-lengths. It never sees a conversation's future.
-
-## Baselines it is compared against
-
-| Policy | Rule |
-|---|---|
-| `lru` | least recently used (vLLM; also Preble's local eviction, `radix_cache.evict()`) |
-| `lfu` | least frequently used |
-| `preble-cost` | adapted from Preble's routing cost model (`SlidingWindowHistogram`): uses in the last 3 minutes × recompute cost. Preble uses this to pick a GPU, not to evict; applying it to eviction is our adaptation |
-| `predictive` | the earlier history-only heuristic (`Session.return_likelihood`) |
-| `perfect-return` | true next-arrival times (upper bound for return-time prediction) |
-| `oracle` | Belady: evicts the block needed furthest in the future (upper bound for any policy) |
-
-Headline metric: **fraction of the LRU → oracle gap closed**, alongside
-cached-token rate and recomputed tokens, over several loads and memory
-budgets.
+1. **Real serving, scheduling only.** A session-aware scheduler in front of
+   an unmodified vLLM on a Kaggle T4 (README.md). It can reorder requests but
+   cannot change what vLLM evicts, so it cannot test an eviction idea.
+2. **CPU simulator** (`src/kvcache/cachesim.py`, CACHE_SIMULATION.md). A model
+   of a prefix cache of 16-token blocks, replayed on synthetic multi-session
+   traffic. An oracle that knows the future beats LRU by about 4 points of
+   cached tokens at a T4-sized budget. Two lessons: a predictor must
+   estimate return time *and* whether the next prompt still matches, and
+   synthetic gaps are memoryless, so idle time carries no information there.
+3. **Eviction rules compared in the simulator.** LRU, LFU, `preble-cost`
+   (Preble's windowed-use routing cost, adapted), a hand-written history
+   heuristic (`predictive`), `perfect-return` (told true next-arrival times,
+   a ceiling and not deployable) and `oracle` (Belady). On synthetic
+   traffic the heuristic was slightly *worse* than LRU. Reason:
+   plausible-looking prediction without data hurts.
+4. **Real traffic and a learned predictor** (WildChat). Return probability
+   and fit probability counted from the earlier 60% of days, evaluated on the
+   later 40%: first on its own (calibration, Brier, AUC), then as the
+   eviction rule in the simulator.
+5. **Preble's real code.** Preble's own `RadixCache` driven with the same
+   events, with only the eviction order swapped.
+6. **A second dataset** (Qwen-Bailian Trace A), added last as a
+   generalisation check. Quality transfers; the eviction benefit does not
+   (details at the end).
 
 ---
 
-## Implementation log
+## What we change in Preble
 
-| Date | Step | Status |
+Preble (`WukLab/preble`, commit `1a35eae`) has two separate decisions:
+
+| Decision | Where | Touched? |
 |---|---|---|
-| 2026-09-21 | WildChat loader (`src/kvcache/wildchat.py`), time-based train/test split | done, commit `584a649` |
-| 2026-09-21 | Predictor model (`src/kvcache/predictor.py`) and fit script (`experiments/predictor_fit.py`) | done |
-| 2026-09-21 | Standalone check on the test days | done: calibrated, AUC 0.786 (results below) |
-| 2026-09-21 | Eviction policies in the simulator (`reuse`, `lfu`, `preble-cost`); replies cached | done |
-| 2026-09-22 | Evaluation sweep over load and memory (`experiments/wildchat_eviction.py`) | done: results below |
+| Which GPU gets the request (global E2 router) | router | no |
+| Which queued request runs next (local priority queue over the radix tree) | `python/sglang/srt/managers/router/scheduler.py` | no |
+| Prefix matching, insertion, node splitting, lock pinning | `radix_cache.py` | no |
+| **Which cached leaf to drop when memory is needed** | **`RadixCache.evict()`, `radix_cache.py:133`** | **yes** |
+
+`evict()` is called from `model_rpc.py:355` when a batch needs KV memory. Stock
+behaviour: collect the leaves, heapify by `last_access_time` (`TreeNode.__lt__`),
+pop the oldest, skip nodes with `lock_ref > 0`, delete the leaf, and push its
+parent when it becomes a leaf.
+
+**Our change, one line of intent:** the heap is ordered by
+`(1 − Π(1 − value_s), last_access_time)` instead of `last_access_time`, where
+`s` ranges over the conversations that own the leaf. Everything else in
+`evict()` is unchanged. `experiments/preble_radix_eval.py` does this in a
+subclass (`PredictorCache.evict`); Preble's repository is never edited.
+
+What the predictor needs that stock Preble does not have:
+
+1. **Owners per node.** Which conversations passed through each tree node;
+   copied on `_split_node`. (Harness: `Tagged.tag`.)
+2. **Per-conversation state**: turns done, time of last request, cached
+   length. Updated when a request is served.
+3. **A session ID on each request.** In the harness the replay supplies it. In
+   a live system it would have to travel with the request; that plumbing is
+   not built.
+4. **The fitted tables**, produced offline from a trace and loaded at startup.
+5. **A clock.** Preble stamps nodes with `time.time()`; the harness replaces it
+   with the trace's timestamps because a replay runs in seconds, not days.
+   That is a test-harness detail, not part of the change.
+
+Interaction with scheduling is the open question. The scheduler decides which
+request pins which prefix; eviction decides what is dropped when room is
+needed. We change only the second, but a scheduler that reorders requests
+changes the idle gaps the predictor was fitted on. Not tested.
+
+---
+
+## How the predictor works
+
+Short version; the derivation with worked numbers is in
+[PROBABILITY_GUIDE.md](PROBABILITY_GUIDE.md).
+
+```
+value(conversation) = P(returns within H | idle a, turns so far)  ×  P(next prompt fits)
+value(leaf)         = 1 − Π (1 − value(s))     over the conversations s owning it
+```
+
+- Return term: counted from training data. Per turn group (1, 2, 3, 4–5, 6–9,
+  10+): the share of conversations that ended, and the sorted gaps to the next
+  turn. `F(x) = (1 − p_end) · ECDF_gaps(x)`, and
+  `P = (F(a + H) − F(a)) / (1 − F(a))`.
+- Fit term: the share of past follow-up messages short enough to fit in
+  `max_context − cached length`.
+- `H` = age of the least recently used cached leaf: a heuristic for how long
+  the cache holds anything. Not derived, and not ablated.
+- Nothing in it assumes WildChat, but every number is counted from a trace, so
+  the tables must be refitted on each workload (seconds).
+
+Code: `src/kvcache/predictor.py`.
+
+---
+
+## Reproduce everything
+
+Tested on macOS, Python 3.13.5, torch 2.8.0, transformers 4.57.6, numpy 2.2.6,
+pandas 2.2.3, pyarrow 25.0.1. No GPU. All commands run from the repo root.
+
+**1. Environment**
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install torch==2.8.0 transformers==4.57.6 numpy pandas pyarrow
+git clone https://github.com/WukLab/preble ~/development/preble
+git -C ~/development/preble checkout 1a35eae     # the commit used here
+export PYTHONPATH=src
+```
+
+The first run downloads the Qwen2.5-1.5B-Instruct tokenizer (tokenizer only)
+from Hugging Face. (`requirements.txt` is for the GPU experiments and pins
+vLLM; it is not needed here.)
+
+**2. Data** (`data/` is gitignored)
+
+```bash
+mkdir -p data/wildchat data/bailian
+curl -L -o data/wildchat/train-00000-of-00014.parquet \
+  https://huggingface.co/datasets/allenai/WildChat-1M/resolve/main/data/train-00000-of-00014.parquet
+curl -L -o data/bailian/qwen_traceA_blksz_16.jsonl \
+  https://media.githubusercontent.com/media/alibaba-edu/qwen-bailian-usagetraces-anon/main/qwen_traceA_blksz_16.jsonl
+```
+
+Use `media.githubusercontent.com` for Bailian: the `raw` URL returns a
+133-byte Git LFS pointer. Checksums of the files used here (SHA-256):
+
+```
+abec2a13129db8c0e6a2d3a51ff12644873c748205a6fdf6551fbcb34430e51c  data/wildchat/train-00000-of-00014.parquet
+07cedc9ed8aff301994ac68ed4aede8123b7603673575eeba9dd677de663db17  data/bailian/qwen_traceA_blksz_16.jsonl
+```
+
+**3. Run**
+
+| Step | Command | Time | Output |
+|---|---|---|---|
+| Unit tests | `python -m unittest tests.test_core` | seconds | 51 tests pass |
+| Predictor quality, WildChat | `python experiments/predictor_fit.py` | ~25 s | printed |
+| Eviction, WildChat simulator | `python experiments/wildchat_eviction.py` | ~18 min | `results/wildchat/eviction.csv` |
+| Inside Preble's radix cache | `python experiments/preble_radix_eval.py --preble ~/development/preble --rates 10,20,40 --capacities 1000,3004,6000` | ~10 min | `results/preble/radix_eval.csv` |
+| Second dataset, quality + eviction | `python experiments/bailian_eval.py` | ~21 min | `results/bailian/eviction.csv` |
+| Synthetic study | `python experiments/cache_headroom.py` | ~3 min | `results/cpu_headroom/headroom.csv` |
+
+Everything is seeded (seeds 0, 1, 2), so reruns reproduce the committed CSVs.
+Checked: `wildchat_eviction.py` reproduces `eviction.csv` exactly (264 rows,
+maximum difference 0.0); `bailian_eval.py` reproduces `results/bailian/eviction.csv` exactly (75
+rows, 0 differences); `preble_radix_eval.py` reproduces the 30 rows of its default
+settings (rates 20 and 40, 3,004 blocks) exactly. `predictor_fit.py` prints
+the same Brier and AUC as above.
+
+Numbers in this file come from these CSVs and printed outputs; the summary
+tables below are computed from them (for example, "gap closed" is
+`(policy − LRU) / (oracle − LRU)`, paired by seed and setting).
 
 ---
 
 ## Results
 
-### Standalone check (2026-09-21)
+### Predictor quality on its own (WildChat)
 
-`PYTHONPATH=src python experiments/predictor_fit.py` (about 25 s). Fitted on
-35,914 conversations from the first 60% of days; checked on 23,943 from the
-last 40%, which it never saw.
-
-**What happens after a turn** (training days):
-
-| Turns so far | Cases | Ended there | Median gap | p90 gap |
-|---|---|---|---|---|
-| 1 | 35,914 | 46.9% | 111 s | 1,474 s |
-| 2 | 19,072 | 33.3% | 113 s | 1,487 s |
-| 3 | 12,715 | 28.3% | 112 s | 1,423 s |
-| 4–5 | 15,899 | 24.8% | 108 s | 1,358 s |
-| 6–9 | 14,668 | 22.6% | 88 s | 1,103 s |
-| 10+ | 7,450 | 24.8% | 63 s | 697 s |
-
-Conversations that have already continued are less likely to end, and
-longer conversations come back faster.
-
-**P(returns within 5 minutes | idle so far)**:
-
-| Turns so far | idle 0 s | 60 s | 120 s | 300 s | 900 s | 1,800 s | 3,600 s |
-|---|---|---|---|---|---|---|---|
-| 1 | 0.357 | 0.228 | 0.150 | 0.086 | 0.036 | 0.011 | 0.003 |
-| 2 | 0.454 | 0.326 | 0.224 | 0.130 | 0.053 | 0.016 | 0.008 |
-| 4–5 | 0.531 | 0.405 | 0.284 | 0.161 | 0.063 | 0.023 | 0.008 |
-| 10+ | 0.620 | 0.426 | 0.265 | 0.127 | 0.038 | 0.013 | 0.003 |
-
-Idle time is highly informative: a conversation silent for 5 minutes is
-about 4× less likely to return in the next 5 minutes than one that just
-finished a turn. (Under the synthetic generator's memoryless gaps these
-rows would be flat, which is why the earlier heuristic learned nothing.)
-
-**Held-out quality** (339,117 test situations, horizon 5 min, 27.3%
-returned):
+Fitted on 35,914 conversations (first 60% of days); checked on 23,943 from
+the last 40%, 339,117 test situations, horizon 5 min, 27.3% returned.
 
 | | Value |
 |---|---|
@@ -174,24 +202,21 @@ returned):
 | Brier score, constant average rate | 0.199 |
 | AUC (0.5 = coin flip) | **0.786** |
 
-Calibration: when it predicts 1.6% the observed rate is 1.3%; 14.8% → 14.7%;
-39.0% → 41.1%; 56.1% → 59.1%. The probabilities can be used as
-probabilities, not just as a ranking.
+Calibration: predicted 1.6% → observed 1.3%; 14.8% → 14.7%; 39.0% → 41.1%;
+56.1% → 59.1%.
 
-**P(next prompt still fits 4,096 tokens)**: 0.999 at 1,000 tokens, 0.993 at
-3,000, 0.949 at 3,900, 0 once full. Follow-up messages are short, so this
-term only matters for conversations near the limit, as expected.
+Idle time matters: P(returns within 5 min) for a conversation with 2 turns so
+far is 0.454 just after a turn, 0.326 after 60 s idle, 0.130 after 300 s,
+0.016 after 1,800 s. (Full table: `predictor_fit.py` output.)
 
-### Eviction on real WildChat traffic (2026-09-22)
+### Eviction, WildChat simulator
 
-`PYTHONPATH=src python experiments/wildchat_eviction.py` (about 18 minutes;
-CSV in `results/wildchat/eviction.csv`). Predictor fitted on the training
-days; 3 seeds, each a separate slice of 2,000 test conversations
-(5,500–6,200 requests); loads of 5–40 new conversations per minute; KV
-budgets of 1,000, 3,004 (≈ the T4 at `gpu_memory_utilization=0.3`) and
-6,000 blocks; context limit 4,096; the first 10 minutes excluded.
+3 seeds (each a separate slice of 2,000 test conversations), loads of 5–40
+new conversations per minute, budgets of 1,000 / 3,004 (≈ T4 at
+`gpu_memory_utilization=0.3`) / 6,000 blocks, context limit 4,096, first 10
+minutes excluded.
 
-**Cached-token rate at the T4 budget (3,004 blocks)**, mean of 3 seeds:
+Cached-token rate at 3,004 blocks (mean of 3 seeds):
 
 | Load (new conv/min) | LRU | Reuse predictor | Perfect return | Oracle | Infinite |
 |---|---|---|---|---|---|
@@ -200,87 +225,39 @@ budgets of 1,000, 3,004 (≈ the T4 at `gpu_memory_utilization=0.3`) and
 | 20 | 0.369 | 0.436 | 0.708 | 0.719 | 0.881 |
 | 40 | 0.257 | 0.321 | 0.625 | 0.638 | 0.886 |
 
-**Share of the LRU → oracle gap each policy closes**, all 12 settings
-(range across settings; paired by seed):
+Share of the LRU → oracle gap closed, all 12 settings:
 
 | Policy | Gap closed | Settings above LRU |
 |---|---|---|
 | `reuse` (learned predictor) | **+10% to +20%** | **12/12 (36/36 seed-runs)** |
-| `perfect-return` (true return times) | +92% to +97% | 12/12 |
-| `preble-cost` (Preble's windowed-use cost, adapted) | 0% to +8% | 7/12 |
-| `predictive` (hand-written heuristic) | −170% to 0% | 0/12 |
+| `perfect-return` | +92% to +97% | 12/12 |
+| `preble-cost` | 0% to +8% | 7/12 |
+| `predictive` (hand-written) | −170% to 0% | 0/12 |
 | `lfu` | −575% to −17% | 0/12 |
 
-**Prefill work saved** (recomputed prompt tokens, relative to LRU): the
-reuse predictor saves **4–11%**; perfect return-time knowledge would save
-27–57%; the oracle 28–59%.
+The predictor saves 4–11% of prefill tokens relative to LRU (perfect return
+would save 27–57%).
 
-**What this shows**
+What this shows:
 
-1. **On real traffic, when a conversation returns is almost the whole
-   story.** Evicting by true return time closes 92–97% of the gap to the
-   oracle in every setting. Truncation, which broke this in the synthetic
-   study, is rare at 4,096 tokens (0.6% of requests).
-2. **The learned predictor beats LRU everywhere,** in all 36 seed-runs, by
-   up to 6.8 points of cached tokens (20 conv/min at the T4 budget: 0.369 →
-   0.436, 10.6% less prefill).
-3. **But it recovers only 10–20% of what perfect return prediction would.**
-   The eviction rule is right (perfect-return proves it); the bottleneck is
-   prediction accuracy. Its AUC is 0.786 using only turn count and idle
-   time.
-4. **Frequency is the wrong signal.** LFU is far worse than LRU: blocks of
-   long-finished conversations keep their high counts and clog the cache.
-   Preble's windowed-use cost avoids that with its 3-minute window and
-   roughly matches LRU (up to +8% of the gap), which fits its purpose: it
-   was designed to balance load across GPUs, not to rank evictions.
-5. **The earlier hand-written heuristic is worse than LRU** in every
-   setting: plausible-looking prediction without data is harmful.
+1. When a conversation returns is almost the whole story: evicting by true
+   return time closes 92–97% of the gap.
+2. The learned predictor beats LRU everywhere but recovers only 10–20% of
+   what perfect return knowledge would; return prediction accuracy is the
+   bottleneck.
+3. Frequency is the wrong signal (LFU keeps long-finished conversations).
+   Preble's windowed cost roughly matches LRU, which fits its purpose
+   (balancing GPUs, not ranking evictions).
+4. The hand-written heuristic is worse than LRU everywhere.
 
-**Next:** improve return prediction with more signals available at serving
-time (the user's history via `hashed_ip`, message and reply length, whether
-the reply ended with a question, time of day), and measure how much of the
-remaining gap to `perfect-return` each closes.
+### Inside Preble's real radix cache (WildChat)
 
-### Reproduction and scope (2026-09-23)
+Method as in "What we change in Preble". Differences from the simulator are
+Preble's own behaviour: capacity in tokens (budget × 16), whole leaves
+evicted at a time (partial eviction off), and the running request pins its
+matched prefix while room is made.
 
-Re-ran both checks. `predictor_fit.py` gives the same AUC (0.786) and Brier
-score (0.1597 vs 0.1986). `wildchat_eviction.py`, after moving the predictor
-fit and the sweep into `fit_predictor()` and `sweep()`, reproduces
-`results/wildchat/eviction.csv` exactly (264 rows, maximum difference 0.0).
-
-What these results do and do not support:
-
-- Supported: on WildChat, replayed in arrival order in the simulator, the
-  learned predictor beats LRU in all 36 seed-runs; the predictor is fitted on
-  earlier days and evaluated on later ones.
-- Not yet shown: other datasets (the tables are fitted to WildChat's gap
-  distribution), Preble's real scheduler and eviction path (the simulator has
-  no queue reordering or GPU routing), and latency or throughput.
-- `perfect-return` uses future arrival times, so it is a ceiling for return
-  prediction, not something a deployed predictor can reach.
-
-### Inside Preble's real radix cache (2026-09-24)
-
-`PYTHONPATH=src python experiments/preble_radix_eval.py --preble ~/development/preble`
-(about 10 minutes, CSV in `results/preble/radix_eval.csv`).
-
-**Method.** Preble's own `RadixCache` (`python/sglang/srt/managers/router/radix_cache.py`)
-is loaded unmodified by file path and driven with the same WildChat events as
-`cachesim`, on a virtual clock (Preble stamps nodes with `time.time()`). Its
-tree, prefix matching, node splitting and `inc_lock_ref` pinning are used as
-is. Preble's local eviction is LRU: `evict()` pops leaves from a min-heap
-ordered by `last_access_time`, skipping pinned nodes. The predictor arm is a
-subclass that overrides only `evict()`: same loop, but the heap key is
-`1 - prod(1 - value_s)` over the conversations owning the leaf (ties by last
-access time), using the same `session_value` and horizon H as the simulator.
-Preble's repository is not modified.
-
-Differences from the block simulator, all Preble's behaviour: capacity in
-tokens (budget x 16), whole leaves evicted at a time (partial eviction off),
-and the running request pins its matched prefix while room is made.
-
-**Cached-token rate**, mean of 3 seeds (each a separate slice of 2,000 test
-conversations; first 10 minutes excluded):
+Cached-token rate, mean of 3 seeds:
 
 | Load (new conv/min) | Blocks | Preble LRU | Preble + predictor | Gain | Simulator gain |
 |---|---|---|---|---|---|
@@ -294,15 +271,70 @@ conversations; first 10 minutes excluded):
 | 40 | 3,004 | 0.263 | 0.321 | +0.058 | +0.065 |
 | 40 | 6,000 | 0.474 | 0.529 | +0.055 | +0.054 |
 
-**What this shows.** The predictor beats Preble's LRU in all 27 seed-runs
-(minimum gain +0.010), and its gain tracks the simulator's. Preble's LRU
-matches the simulator's LRU to within 0.011 everywhere, which supports the
-simulator's model of the cache.
+The predictor beats Preble's LRU in all 27 seed-runs (minimum gain +0.010),
+its gain tracks the simulator's, and Preble's LRU matches the simulator's LRU
+within 0.011, which supports the simulator as a model of the cache.
 
-**Limits.** Requests are served in arrival order: no Preble scheduler,
-router, priority queue or GPU, and no latency or throughput measurement. The
-result is that the predictor works inside Preble's real eviction path, not
-that Preble with it is faster end to end. WildChat only. Preble's own
-benchmarks (ToolBench, LooGLE, video QA, APPS) are mostly independent
-requests over shared prefixes with generated arrival times, so the idle-time
-signal this predictor relies on would be absent there.
+### Second dataset: Qwen-Bailian Trace A (2026-09-25)
+
+Aliyun's anonymised production chat trace (ATC '25): 23,101 sessions, 43,058
+requests, block hashes and timestamps, no text. Sessions split by start time,
+first 60% train / last 40% test (`src/kvcache/bailian.py`,
+`experiments/bailian_eval.py`). Trace B (single-turn API calls) has no
+sessions and cannot be used.
+
+**Predictor quality**, 97,661 held-out situations, horizon 300 s, 18.2%
+returned:
+
+| Tables | Brier | AUC |
+|---|---|---|
+| Constant average rate | 0.1490 | - |
+| Refit on Bailian's training sessions | 0.1266 | 0.784 |
+| WildChat's tables, unchanged | 0.1281 | 0.783 |
+
+The refit is calibrated (predicted 0.37 → observed 0.39, 0.55 → 0.61). The
+WildChat tables rank equally well but are overconfident in the middle
+(predicted 0.08 → observed 0.04; 0.38 → 0.32). The signal, that long idle
+means unlikely to return, is a property of both traces, not just WildChat.
+
+**Eviction** (simulator; 10% of sessions per seed, 3 seeds, cache = 2% / 5% /
+10% of the unique blocks; whole trace replayed, requests counted from the
+start of the test period). Cached-token rate, mean of 3 seeds:
+
+| Cache | LRU | Reuse (refit) | Reuse (WildChat tables) | Perfect return | Oracle |
+|---|---|---|---|---|---|
+| 2% | 0.208 | 0.239 | 0.227 | 0.487 | 0.492 |
+| 5% | 0.399 | 0.399 | 0.387 | 0.648 | 0.652 |
+| 10% | 0.539 | 0.544 | 0.539 | 0.701 | 0.706 |
+
+Gap closed: refit +10.9% / +0.3% / +2.8%, ahead of LRU in 7 of 9 runs;
+WildChat tables +6.6% / −4.6% / −0.4%, ahead in 4 of 9. Perfect return closes
+97–99%, so as on WildChat the rule is fine and prediction is the limit, but
+here the learned predictor gets far less of it.
+
+**Not yet explained.** Candidate causes, none tested: prompts are very long
+here (about 190 blocks on average, up to about 90,000 tokens), so few
+requests fit per cache; many leaves may tie on value and fall back to LRU; the
+32,768-token context limit for the fit term is assumed (it is not in the
+trace); and the 10% session subsample changes the load. The Preble radix
+harness has not been run on Bailian.
+
+---
+
+## Limits
+
+- Arrival-order replay: no Preble scheduler, router, priority queue or GPU,
+  and no latency or throughput measurement. The result is that the predictor
+  works inside Preble's real eviction path, not that Preble with it is
+  faster end to end.
+- Two datasets, both chat. Preble's own benchmarks (ToolBench, LooGLE, video
+  QA, APPS) are mostly independent requests over shared prefixes with
+  generated arrival times, where idle time carries no signal.
+- `H`, turn groups and the independence assumptions (return vs fit, owners)
+  are design choices and are not ablated.
+- `perfect-return` and `oracle` use the future: ceilings, not deployable.
+- The predictor must be refitted per workload.
+- Closest prior work: "KVCache Cache in the Wild" (ATC '25) fits a
+  per-category exponential reuse-time distribution for eviction; this work
+  uses non-parametric conditioning on idle time and turn count, and adds a
+  fit term (as far as we know; we did not read that paper's code).

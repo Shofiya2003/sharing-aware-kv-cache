@@ -1,12 +1,29 @@
-# Session- and Sharing-Aware Request Scheduling for Real LLM Serving
+# A learned reuse predictor for KV-cache eviction
 
-A request-scheduling layer built on top of [vLLM](https://github.com/vllm-project/vllm) that prioritizes and orders concurrent, multi-session, multi-turn LLM requests based on per-session activity signals and cross-session content-sharing signals. Benchmark under realistic irregular concurrent load and constrained GPU cache memory — measuring **real** cache hit rate, latency, and goodput.
+**Start here: [PREDICTOR.md](PREDICTOR.md)** — replaces LRU eviction (what
+vLLM and Preble/SGLang both use) with a predictor of which cached
+conversation is least likely to be reused, learned from real chat traffic.
+Evaluated in a CPU simulator and inside Preble's own, unmodified
+`RadixCache`, on two independent real traces (WildChat, Qwen-Bailian). The
+probability math behind it, explained from scratch: [PROBABILITY_GUIDE.md](PROBABILITY_GUIDE.md).
+The earlier synthetic study that motivated it: [CACHE_SIMULATION.md](CACHE_SIMULATION.md).
 
-> One-line: _Built a session- and sharing-aware request scheduling layer on top of vLLM, benchmarking real cache hit rate, latency, and goodput under concurrent multi-session LLM serving load with constrained GPU memory._
+Headline: on WildChat it beats LRU in all 36 simulator seed-runs and all 27
+seed-runs inside Preble's real eviction path; on a second, independent trace
+(Qwen-Bailian) the gain is small. Both results, and their limits, are in
+PREDICTOR.md.
 
 ---
 
-> **CPU eviction study:** how much better than vLLM's LRU eviction could a smarter policy do, and what must it predict? See [CACHE_SIMULATION.md](CACHE_SIMULATION.md).
+## Earlier work in this repo: a request-scheduling layer
+
+Before the eviction predictor, this repo held a request-scheduling layer
+built on top of [vLLM](https://github.com/vllm-project/vllm) that
+prioritizes and orders concurrent, multi-session, multi-turn LLM requests
+based on per-session activity signals and cross-session content-sharing
+signals, benchmarked under constrained GPU cache memory. It sits in front of
+vLLM and reorders requests; it does not touch eviction, which is what the
+predictor above is about. Kept here for context; see below for what it does.
 
 ## What this is
 
