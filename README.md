@@ -63,31 +63,51 @@ latency or throughput. The predictor must be refitted for each workload, and
 the horizon `H` and the independence assumptions are design choices that have
 not been ablated. See PREDICTOR.md, "Limits".
 
-## Reproduce (CPU only)
+## Quick start (CPU only, no GPU or vLLM)
+
+Every number in [PREDICTOR.md](PREDICTOR.md) comes from the steps below.
+All scripts run from the repo root and are seeded, so reruns reproduce the
+committed CSVs.
 
 ```bash
+# 1. environment (tested: Python 3.13, torch 2.8.0, transformers 4.57.6)
 python -m venv .venv && source .venv/bin/activate
 pip install torch==2.8.0 transformers==4.57.6 numpy pandas pyarrow matplotlib
+export PYTHONPATH=src
+
+# 2. Preble, at the commit used here (read, never modified)
 git clone https://github.com/WukLab/preble ~/development/preble
 git -C ~/development/preble checkout 1a35eae
-export PYTHONPATH=src
-# download the two datasets: see PREDICTOR.md, "Reproduce everything"
 
-python experiments/predictor_fit.py        # ~25 s   predictor quality (WildChat)
-python experiments/wildchat_eviction.py    # ~18 min simulator sweep (WildChat)
+# 3. data (gitignored): one WildChat shard and Qwen-Bailian Trace A
+mkdir -p data/wildchat data/bailian
+curl -L -o data/wildchat/train-00000-of-00014.parquet \
+  https://huggingface.co/datasets/allenai/WildChat-1M/resolve/main/data/train-00000-of-00014.parquet
+curl -L -o data/bailian/qwen_traceA_blksz_16.jsonl \
+  https://media.githubusercontent.com/media/alibaba-edu/qwen-bailian-usagetraces-anon/main/qwen_traceA_blksz_16.jsonl
+
+# 4. sanity check
+python -m unittest tests.test_core                     # 51 tests, ~20 s
+
+# 5. the experiments
+python experiments/predictor_fit.py                    # ~25 s   predictor quality on held-out WildChat
+python experiments/wildchat_eviction.py                # ~18 min simulator sweep -> results/wildchat/eviction.csv
 python experiments/preble_radix_eval.py --preble ~/development/preble \
-    --rates 10,20,40 --capacities 1000,3004,6000       # ~10 min, inside Preble
-python experiments/bailian_eval.py         # ~21 min second dataset
+    --rates 10,20,40 --capacities 1000,3004,6000       # ~10 min inside Preble -> results/preble/radix_eval.csv
+python experiments/bailian_eval.py                     # ~21 min second dataset -> results/bailian/eviction.csv
 ```
 
-`torch` is used only by the Preble harness (Preble's `RadixCache` handles
-tensors); everything else needs only numpy, pandas, pyarrow and, for
-WildChat, the `transformers` tokenizer. Data URLs, checksums, expected
-outputs and which CSV each script writes are in PREDICTOR.md.
+Notes:
 
-```bash
-PYTHONPATH=src python -m unittest tests.test_core     # 51 tests, ~20 s
-```
+- The Bailian download must use `media.githubusercontent.com`; the `raw`
+  URL returns a 133-byte Git LFS pointer, not the data.
+- The first run downloads the Qwen2.5-1.5B-Instruct tokenizer (tokenizer
+  only) from Hugging Face.
+- `torch` is used only by the Preble harness (Preble's `RadixCache` handles
+  tensors). Everything else needs numpy, pandas, pyarrow and, for WildChat,
+  the tokenizer.
+- File checksums, what each script prints, and the earlier synthetic study
+  (`cache_headroom.py`) are in PREDICTOR.md, "Reproduce everything".
 
 ## Repo layout
 
@@ -135,7 +155,7 @@ Prior work (Preble, 2024) showed prefix-aware scheduling beats naive round-robin
 The design tension under study: an eviction / scheduling policy based only on **session-level signals** ("keep caches for sessions likely to return soon") can starve content that's still valuable to *other* live sessions sharing it. A policy based only on **sharing signals** ("keep whatever's shared by the most sessions") can strand a legitimate, soon-returning session with a unique context. A good policy needs both.
 
 
-## Quick start
+## Quick start for the GPU scheduling experiments
 
 ### Run on a Kaggle/Colab free T4
 
