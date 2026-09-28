@@ -18,20 +18,73 @@ It is evaluated in a CPU simulator and inside Preble's own, unmodified
 - [CACHE_SIMULATION.md](CACHE_SIMULATION.md): the simulator and the
   synthetic study that motivated this.
 
-## Result at a glance
+## Results
 
-| | WildChat | Qwen-Bailian |
-|---|---|---|
-| Predictor quality on held-out data (AUC; 0.5 = coin flip) | 0.786 | 0.784 |
-| Brier score, predictor vs constant rate (lower is better) | 0.160 vs 0.199 | 0.127 vs 0.149 |
-| Simulator: share of the LRU → oracle gap closed | +10% to +20%, ahead of LRU in 36/36 seed-runs | +0.3% to +11%, ahead of LRU in 7/9 |
-| Inside Preble's real `RadixCache` | ahead of Preble's LRU in 27/27 seed-runs | not run |
-| Ceiling: `perfect-return` (told true return times; not deployable) | closes 92–97% of the gap | closes 97–99% |
+**What is measured.** The *cached-token rate*: the share of each request's
+prompt tokens that were still in the cache when the request arrived, so the
+server did not have to recompute them. Higher is better, and every point is
+prefill work not done. The baseline is **LRU** (drop the least recently used
+entry), which is what vLLM and Preble do today. Requests are replayed from
+real chat logs; the predictor is fitted on earlier days and tested on later
+ones it has never seen.
 
-Reading it: the eviction rule is sound (knowing return times would close
-almost the whole gap), the learned predictor gets a real but modest part of
-that on WildChat, and much less on Bailian, where the reason is not yet
-known. Details and caveats are in PREDICTOR.md.
+### WildChat, in a simulator
+
+Cache sized like a T4 (3,004 blocks of 16 tokens), at four loads. Mean of 3
+seeds:
+
+| New conversations per minute | LRU | With the predictor | Change | Prefill work saved |
+|---|---|---|---|---|
+| 5 | 67.1% | 68.8% | +1.7 points | 5.1% |
+| 10 | 54.7% | 57.5% | +2.8 points | 6.2% |
+| 20 | 36.9% | 43.6% | +6.7 points | 10.7% |
+| 40 | 25.7% | 32.1% | +6.4 points | 8.8% |
+
+Over all 12 settings (4 loads × 3 cache sizes) the predictor beats LRU every
+time, by +1.1 to +6.8 points, saving about 4–11% of prefill work; it is ahead
+in all 36 individual runs. The gain is largest when the cache is under
+pressure (small cache or high load), because that is when eviction choices
+matter.
+
+### WildChat, inside Preble's own cache
+
+The same replay through Preble's real, unmodified `RadixCache`, changing only
+which leaf it evicts. At 3,004 blocks: 10 conversations/min 55.3% → 58.4%,
+20/min 37.5% → 43.8%, 40/min 26.3% → 32.1%. Over 9 settings the gain is +1.4
+to +6.4 points, ahead of Preble's LRU in all 27 runs.
+
+### Qwen-Bailian, a second, independent trace
+
+Predictor refitted on this trace. Cache sized as a share of the unique data
+in the replay. Mean of 3 seeds:
+
+| Cache size | LRU | With the predictor | Change | Prefill work saved |
+|---|---|---|---|---|
+| 2% | 20.8% | 23.9% | +3.1 points | 3.9% |
+| 5% | 39.9% | 39.9% | +0.1 points | 0.1% |
+| 10% | 53.9% | 54.4% | +0.5 points | 1.1% |
+
+Ahead of LRU in 7 of 9 runs, but the gain is small, and at the two larger
+cache sizes it is close to nothing. We do not yet know why.
+
+### How good is the prediction itself?
+
+Separately from eviction, does it tell which conversations will come back
+within 5 minutes? Score: AUC, the chance that, given one conversation that
+came back and one that did not, it rated the returning one higher (50% = coin
+flip). **WildChat 78.6%, Bailian 78.4%**, and using WildChat's tables
+unchanged on Bailian gives 78.3%. Its probabilities are also calibrated: on
+WildChat, when it says 39% about 41% return.
+
+### How much room is there?
+
+For reference, a cache that could see the future (an impossible upper bound)
+would reach 71.9% at 20 conversations/min, 3,004 blocks, against LRU's 36.9%
+and the predictor's 43.6%. Eviction has a lot of headroom, and the
+predictor gets part of it. Telling the cache each conversation's exact return
+time would get almost all the way there (70.8%), so the remaining problem is
+predicting return times better, not the eviction rule itself. The full
+comparison, with the other policies tried, is in PREDICTOR.md.
 
 ## How it plugs into Preble
 

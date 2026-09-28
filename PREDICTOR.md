@@ -20,12 +20,15 @@ Related files:
   (Brier 0.160 vs 0.199 for a constant rate, AUC 0.786). On a second real
   trace (Qwen-Bailian) it is equally good (AUC 0.784), and WildChat's tables
   applied unchanged reach 0.783.
-- **Eviction, WildChat.** Beats LRU in all 36 simulator seed-runs and all 27
-  seed-runs inside Preble's real radix cache; closes 10–20% of the gap
-  between LRU and the oracle. Knowing true return times would close 92–97%,
-  so the eviction rule is right and prediction accuracy is the limit.
-- **Eviction, Bailian.** Weak: +0.3% to +11% of the gap, ahead of LRU in
-  7 of 9 runs, and the WildChat tables do not help there. Causes untested.
+- **Eviction, WildChat.** Raises the cached-token rate over LRU by +1.1 to
+  +6.8 points (about 4–11% less prefill work) in all 36 simulator seed-runs,
+  and by +1.4 to +6.4 points in all 27 seed-runs inside Preble's real radix
+  cache. That is 10–20% of the distance from LRU to an oracle that sees the
+  future. Knowing true return times would cover 92–97% of it, so the eviction
+  rule is right and prediction accuracy is the limit.
+- **Eviction, Bailian.** Weak: +0.1 to +3.1 points (0.1–3.9% less prefill),
+  ahead of LRU in 7 of 9 runs, and the WildChat tables do not help there.
+  Causes untested.
 - **Not shown.** Any effect with Preble's scheduler or router, on a GPU, or
   on latency and throughput. Requests are replayed in arrival order.
 
@@ -190,6 +193,16 @@ tables below are computed from them (for example, "gap closed" is
 ---
 
 ## Results
+
+**How to read the numbers.** *Cached-token rate* = share of prompt tokens
+found in the cache instead of recomputed (higher is better); "points" are
+percentage points of it. *Prefill work saved* = the drop in recomputed tokens
+relative to LRU. *Oracle* (Belady) evicts what is needed furthest in the
+future, and *perfect-return* evicts by the true next-arrival time of each
+conversation; both use the future, so they are ceilings that show how much
+room there is, not policies anyone can run. *Gap closed* = (policy − LRU) /
+(oracle − LRU): the share of the distance from LRU to the oracle. It is the
+least intuitive column, so the plain cached-token rates are given next to it.
 
 ### Predictor quality on its own (WildChat)
 
