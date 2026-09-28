@@ -189,6 +189,46 @@ below. That work does need a GPU and vLLM.
 
 ---
 
+## Remaining work and known gaps
+
+What this project has not done, stated so the results above are not read as
+more than they are:
+
+1. **The predictor is fitted per dataset.** Its tables are counted from a
+   trace, so every workload needs its own fit; there is no single set of
+   numbers to drop into a new deployment. Tables fitted on WildChat and
+   applied unchanged to Bailian still ranked conversations well (AUC 78.3%)
+   but gave little eviction gain there (cached-token rate against LRU:
+   +1.9 points at the 2% cache, −1.2 at 5%, 0.0 at 10%). Only two datasets,
+   both chat, have been tried. Whether it helps on other traffic (API calls, agents, tool use
+   with generated arrival times) is untested.
+2. **Latency is not measured.** "Prefill work saved" counts tokens not
+   recomputed. It has not been converted into time to first token, end-to-end
+   latency or throughput, and the two are not proportional.
+3. **No real GPU, no real model.** Nothing here runs requests through an LLM.
+   Requests are replayed in arrival order against the cache logic only, in a
+   simulator and inside Preble's `RadixCache` on a virtual clock. Preble's
+   scheduler and router, batching, and memory pressure from a running model
+   are not present.
+
+Also open:
+
+- **Why Bailian's gain is small.** Candidate causes (very long prompts, ties
+  falling back to LRU, the assumed context limit, the 10% subsample) are
+  untested, and the Preble harness has not been run on Bailian.
+- **Design choices without ablations:** the horizon `H`, the turn groups, the
+  independence assumptions, and which of the inputs (turn count, idle time,
+  fit term, sharing across conversations) produces the gain over LRU.
+- **Interaction with scheduling.** A scheduler that reorders requests changes
+  the idle gaps the predictor was fitted on.
+- **Deployment plumbing.** A live system needs a session ID on every request
+  and the fitted tables loaded at startup; neither is built.
+- **A richer predictor.** Only turn count and idle time are used. Per-user
+  history, message features and time of day are untried, and the
+  future-seeing ceiling above says there is room.
+
+---
+
 # Earlier work: session-aware request scheduling in front of vLLM (needs a GPU)
 
 **Status: where this project started, and why it moved.** This is the first
