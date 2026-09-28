@@ -139,8 +139,8 @@ pandas 2.2.3, pyarrow 25.0.1. No GPU. All commands run from the repo root.
 **1. Environment**
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install torch==2.8.0 transformers==4.57.6 numpy pandas pyarrow
+python3.13 -m venv .venv && source .venv/bin/activate   # torch 2.8.0 has no 3.14 wheels
+pip install torch==2.8.0 transformers==4.57.6 numpy pandas pyarrow matplotlib seaborn
 git clone https://github.com/WukLab/preble ~/development/preble
 git -C ~/development/preble checkout 1a35eae     # the commit used here
 export PYTHONPATH=src

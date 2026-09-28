@@ -120,12 +120,14 @@ not been ablated. See PREDICTOR.md, "Limits".
 
 Every number in [PREDICTOR.md](PREDICTOR.md) comes from the steps below.
 All scripts run from the repo root and are seeded, so reruns reproduce the
-committed CSVs.
+committed CSVs (`results/bailian/` and `results/preble/`; `results/wildchat/`
+is gitignored, so that CSV is regenerated rather than compared).
 
 ```bash
 # 1. environment (tested: Python 3.13, torch 2.8.0, transformers 4.57.6)
-python -m venv .venv && source .venv/bin/activate
-pip install torch==2.8.0 transformers==4.57.6 numpy pandas pyarrow matplotlib
+#    Use Python 3.13: torch 2.8.0 has no wheels for 3.14.
+python3.13 -m venv .venv && source .venv/bin/activate
+pip install torch==2.8.0 transformers==4.57.6 numpy pandas pyarrow matplotlib seaborn
 export PYTHONPATH=src
 
 # 2. Preble, at the commit used here (read, never modified)
@@ -158,7 +160,8 @@ Notes:
   only) from Hugging Face.
 - `torch` is used only by the Preble harness (Preble's `RadixCache` handles
   tensors). Everything else needs numpy, pandas, pyarrow and, for WildChat,
-  the tokenizer.
+  the tokenizer. `matplotlib` and `seaborn` are needed only because
+  `import kvcache` also loads the GPU-study analysis module.
 - File checksums, what each script prints, and the earlier synthetic study
   (`cache_headroom.py`) are in PREDICTOR.md, "Reproduce everything".
 
