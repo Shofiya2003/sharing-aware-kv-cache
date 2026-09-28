@@ -1,29 +1,122 @@
 # A learned reuse predictor for KV-cache eviction
 
-**Start here: [PREDICTOR.md](PREDICTOR.md)** — replaces LRU eviction (what
-vLLM and Preble/SGLang both use) with a predictor of which cached
-conversation is least likely to be reused, learned from real chat traffic.
-Evaluated in a CPU simulator and inside Preble's own, unmodified
-`RadixCache`, on two independent real traces (WildChat, Qwen-Bailian). The
-probability math behind it, explained from scratch: [PROBABILITY_GUIDE.md](PROBABILITY_GUIDE.md).
-The earlier synthetic study that motivated it: [CACHE_SIMULATION.md](CACHE_SIMULATION.md).
+When an LLM server's KV cache is full, something has to go. vLLM and
+Preble/SGLang both drop the **least recently used** prefix. This project
+replaces that with a **learned estimate of which cached conversation is least
+likely to be reused**, counted from real chat traffic, and measures whether it
+keeps more useful tokens cached.
 
-Headline: on WildChat it beats LRU in all 36 simulator seed-runs and all 27
-seed-runs inside Preble's real eviction path; on a second, independent trace
-(Qwen-Bailian) the gain is small. Both results, and their limits, are in
-PREDICTOR.md.
+It is evaluated in a CPU simulator and inside Preble's own, unmodified
+`RadixCache`, on two independent real traces (WildChat, Qwen-Bailian).
+**No GPU and no vLLM are needed to reproduce any of it.**
+
+- **[PREDICTOR.md](PREDICTOR.md)**: the report. What was tried and in what
+  order, what changes in Preble, every result, the limits, and step-by-step
+  reproduction.
+- **[PROBABILITY_GUIDE.md](PROBABILITY_GUIDE.md)**: the probability math
+  behind the predictor, explained from scratch with hand-checkable examples.
+- [CACHE_SIMULATION.md](CACHE_SIMULATION.md): the simulator and the
+  synthetic study that motivated this.
+
+## Result at a glance
+
+| | WildChat | Qwen-Bailian |
+|---|---|---|
+| Predictor quality on held-out data (AUC; 0.5 = coin flip) | 0.786 | 0.784 |
+| Brier score, predictor vs constant rate (lower is better) | 0.160 vs 0.199 | 0.127 vs 0.149 |
+| Simulator: share of the LRU → oracle gap closed | +10% to +20%, ahead of LRU in 36/36 seed-runs | +0.3% to +11%, ahead of LRU in 7/9 |
+| Inside Preble's real `RadixCache` | ahead of Preble's LRU in 27/27 seed-runs | not run |
+| Ceiling: `perfect-return` (told true return times; not deployable) | closes 92–97% of the gap | closes 97–99% |
+
+Reading it: the eviction rule is sound (knowing return times would close
+almost the whole gap), the learned predictor gets a real but modest part of
+that on WildChat, and much less on Bailian, where the reason is not yet
+known. Details and caveats are in PREDICTOR.md.
+
+## How it plugs into Preble
+
+Only one decision is changed: which leaf `RadixCache.evict()` drops. The
+router, the scheduler and prefix matching are untouched.
+
+```
+request needs KV memory
+        │
+        ▼
+RadixCache.evict()                (radix_cache.py)
+  collect leaves ── heapify ── pop the lowest key ── skip if pinned ── delete
+                                     │
+   stock Preble:   key = last_access_time                 oldest leaf first
+   this project:   key = 1 - Π(1 - value_s)               least likely reused first
+                         over the conversations s that own the leaf
+
+   value_s = P(s returns within H | idle so far, turns so far)  ×  P(its next prompt still fits)
+             └─ counted from past traces, per turn group ──────┘
+```
+
+## What is and is not shown
+
+Shown: a predictor fitted on earlier data beats LRU on later data, replayed in
+arrival order, in a simulator and inside Preble's real eviction code.
+
+Not shown: any effect with Preble's scheduler or router, on a GPU, or on
+latency or throughput. The predictor must be refitted for each workload, and
+the horizon `H` and the independence assumptions are design choices that have
+not been ablated. See PREDICTOR.md, "Limits".
+
+## Reproduce (CPU only)
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install torch==2.8.0 transformers==4.57.6 numpy pandas pyarrow matplotlib
+git clone https://github.com/WukLab/preble ~/development/preble
+git -C ~/development/preble checkout 1a35eae
+export PYTHONPATH=src
+# download the two datasets: see PREDICTOR.md, "Reproduce everything"
+
+python experiments/predictor_fit.py        # ~25 s   predictor quality (WildChat)
+python experiments/wildchat_eviction.py    # ~18 min simulator sweep (WildChat)
+python experiments/preble_radix_eval.py --preble ~/development/preble \
+    --rates 10,20,40 --capacities 1000,3004,6000       # ~10 min, inside Preble
+python experiments/bailian_eval.py         # ~21 min second dataset
+```
+
+`torch` is used only by the Preble harness (Preble's `RadixCache` handles
+tensors); everything else needs only numpy, pandas, pyarrow and, for
+WildChat, the `transformers` tokenizer. Data URLs, checksums, expected
+outputs and which CSV each script writes are in PREDICTOR.md.
+
+```bash
+PYTHONPATH=src python -m unittest tests.test_core     # 51 tests, ~20 s
+```
+
+## Repo layout
+
+```
+src/kvcache/
+  predictor.py        the reuse predictor (ReturnModel, FitModel, ReusePredictor)
+  cachesim.py         CPU model of the prefix cache and every eviction policy
+  wildchat.py         WildChat loader, time-based train/test split, workload
+  bailian.py          Qwen-Bailian loader (block hashes, no text)
+  prefix.py           vLLM-style chained block hashes
+experiments/
+  predictor_fit.py        predictor quality on held-out data (Brier, AUC, calibration)
+  wildchat_eviction.py    simulator sweep on WildChat
+  preble_radix_eval.py    the same replay through Preble's real RadixCache
+  bailian_eval.py         quality and eviction on the second dataset
+  cache_headroom.py       the earlier synthetic study
+results/                  CSVs behind every table (wildchat, preble, bailian, cpu_headroom)
+tests/test_core.py        51 tests
+PREDICTOR.md  PROBABILITY_GUIDE.md  CACHE_SIMULATION.md
+```
+
+The rest of the repo (`policies.py`, `bench.py`, `vllm_backend.py`,
+`workload.py`, `session.py`, `metrics.py`, `analysis.py`, the `phase*`
+scripts, the notebooks and `requirements.txt`) belongs to the earlier work
+below. That work does need a GPU and vLLM.
 
 ---
 
-## Earlier work in this repo: a request-scheduling layer
-
-Before the eviction predictor, this repo held a request-scheduling layer
-built on top of [vLLM](https://github.com/vllm-project/vllm) that
-prioritizes and orders concurrent, multi-session, multi-turn LLM requests
-based on per-session activity signals and cross-session content-sharing
-signals, benchmarked under constrained GPU cache memory. It sits in front of
-vLLM and reorders requests; it does not touch eviction, which is what the
-predictor above is about. Kept here for context; see below for what it does.
+# Earlier work: session-aware request scheduling in front of vLLM (needs a GPU)
 
 ## What this is
 
@@ -41,39 +134,6 @@ Prior work (Preble, 2024) showed prefix-aware scheduling beats naive round-robin
 
 The design tension under study: an eviction / scheduling policy based only on **session-level signals** ("keep caches for sessions likely to return soon") can starve content that's still valuable to *other* live sessions sharing it. A policy based only on **sharing signals** ("keep whatever's shared by the most sessions") can strand a legitimate, soon-returning session with a unique context. A good policy needs both.
 
-
-## Repo layout
-
-```
-.
-├── src/kvcache/                  # Core package
-│   ├── session.py                # Multi-turn session lifecycle
-│   ├── prefix.py                 # vLLM-style chained block hashes (what is reusable)
-│   ├── cachesim.py               # CPU model of the prefix cache (eviction headroom)
-│   ├── workload.py               # Multi-session workload generator
-│   ├── policies.py               # 4 dispatch policies (no cache mutation)
-│   ├── vllm_backend.py           # Async wrapper around vLLM
-│   ├── metrics.py                # Time-windowed metrics + CSV writer
-│   ├── bench.py                  # Driver (asyncio) + MockVLLMBackend
-│   └── analysis.py               # Headline / ablation / fairness charts
-├── experiments/                  # CLI scripts (one per phase)
-│   ├── run_experiment.py         # Main entry point
-│   ├── phase1_smoke.py           # vLLM smoke test under pressure
-│   ├── phase2_session.py         # One session, multiple real turns
-│   ├── phase3_workload.py        # Workload + timeline + overlap report
-│   ├── phase4_policies.py        # Policy unit checks
-│   ├── phase5_matrix.py          # 4x2 matrix runner
-│   └── phase6_analysis.py        # Charts from existing CSVs
-├── notebooks/
-│   ├── kaggle_launcher.ipynb     # Thin GPU launcher
-│   └── cpu_cache_headroom.ipynb  # CPU-only eviction headroom study (CACHE_SIMULATION.md)
-├── tests/test_core.py            # 14 unit + integration tests
-├── results/                      # CSVs and figures (per-run, gitignored)
-├── README.md                     # this file
-├── RESEARCH_NOTE.md              # 1-2 page research note
-├── pyproject.toml
-└── requirements.txt
-```
 
 ## Quick start
 
@@ -199,7 +259,7 @@ The headline metrics:
 - **Goodput** (% requests meeting the SLA)
 - **Per-session fairness** (ECDF of per-session hit rates)
 
-## Design choices (the things you should re-read before cold-emailing a PI)
+## Design choices
 
 1. **We do not modify vLLM.** The dispatch layer operates purely on submission order. This is a deliberate architectural choice — see the spec's "Architectural correction from earlier drafts" section. The contribution is *how* you use vLLM under pressure, not what vLLM does internally.
 2. **Hit/miss is ground truth.** We read vLLM's per-request `num_cached_tokens` and cross-check against the engine's own `gpu_prefix_cache_hit_rate`. Every row carries a `hit_basis` column so a run that lost ground truth cannot be mistaken for one that has it. The old latency proxy is published beside it, labelled, for comparison only.
@@ -214,14 +274,6 @@ The headline metrics:
 - 32% of turn transitions hit the context cap and lose their whole prefix, which is the main confound on the session-aware half. Tracked as `context_truncated_rate`; raise `--max-context-tokens` to reduce it.
 - We do not sweep `num_shared_docs` or `overlap_fraction` in the main 8-run matrix. Those ablations are out of scope per the spec ("keep to 4 policies and 2 capacity levels").
 - If the combined policy does NOT clearly beat both single-signal baselines, that is a *legitimate finding*. Report it and diagnose.
-
-## Tests
-
-```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
-```
-
-14 tests cover: session lifecycle, overlap detection (incl. mid-context), workload determinism, policy orderings, end-to-end benchmark with all 4 policies, metrics CSV writing.
 
 ## Citation / use
 
