@@ -138,6 +138,28 @@ below. That work does need a GPU and vLLM.
 
 # Earlier work: session-aware request scheduling in front of vLLM (needs a GPU)
 
+**Status: where this project started, and why it moved.** This is the first
+set of experiments, run on real vLLM on a free-tier Kaggle/Colab T4. It did
+not produce a conclusive result:
+
+- The first round of numbers was discarded because of measurement defects
+  (a latency-threshold stand-in for the hit rate, prompts without
+  conversation history, warmup contamination; see "Two other corrections"
+  below).
+- The most recent matrix with the corrected measurement (the one in
+  `results copy 2/`, not committed) was a single seed, and the four dispatch policies came out within 0.0014 of each other
+  in cached-token rate (0.546–0.547). That is not distinguishable from
+  noise, and one seed cannot say more.
+- Reordering requests cannot change what vLLM evicts, so this design could
+  not test an eviction idea at all.
+- With only free-tier GPU sessions, more seeds, larger workloads and other
+  engines were out of reach.
+
+So the work moved to CPU-only experiments: a cache simulator, real chat
+traces and Preble's real `RadixCache`, which is what the top of this README
+describes. This section is kept for the record. None of the results above use GPU
+output.
+
 ## What this is
 
 A scheduling layer (in `src/kvcache/`) that sits **in front of** a real vLLM instance and decides:
